@@ -475,6 +475,86 @@ async def trigger_auto_registration(count: int, cpa_service_id: int):
 
 
 _is_checking = False
+_is_checking_401 = False
+
+def check_cpa_services_401_job(main_loop, manual_logs: list = None):
+    """快速检查并剔除面板标记 401/403 的凭证（不做测活）"""
+    global _is_checking_401
+    settings = get_settings()
+
+    if not settings.cpa_auto_check_enabled and manual_logs is None:
+        return
+    if not settings.cpa_auto_check_remove_401:
+        return
+    if _is_checking:
+        msg = "当前正在执行完整体检任务，401/403 快速剔除本轮跳过。"
+        if manual_logs is not None:
+            manual_logs.append(f"[WARNING] {msg}")
+            append_system_log("warning", msg)
+        return
+    if _is_checking_401:
+        msg = "当前已有 401/403 快速剔除任务在运行，本轮跳过。"
+        if manual_logs is not None:
+            manual_logs.append(f"[WARNING] {msg}")
+            append_system_log("warning", msg)
+        return
+
+    _is_checking_401 = True
+
+    def _log(msg: str, level: str = 'info'):
+        log_func = getattr(logger, level, logger.info)
+        log_func(msg)
+        append_system_log(level, msg)
+        if manual_logs is not None:
+            manual_logs.append(f"[{level.upper()}] {msg}")
+
+    _log("开始快速检查 CPA 401/403 标记凭证...")
+    try:
+        with get_db() as db:
+            services = crud.get_cpa_services(db, enabled=True)
+            if not services:
+                _log("警告：当前没有任何启用的 CPA 服务！请先配置并启用 CPA 服务。", "warning")
+            for svc in services:
+                try:
+                    _log(f"检查 CPA 服务(401/403 快速剔除): {svc.name}")
+                    files, total_count, skipped_count = fetch_cliproxy_auth_files(svc.api_url, svc.api_token)
+                    if not files:
+                        if total_count > 0:
+                            _log(
+                                f"CPA 服务 {svc.name} 获取到 {total_count} 个凭证，"
+                                f"筛选后没有 Codex 凭证（已跳过 {skipped_count} 个非 Codex/未标注凭证）",
+                                'warning',
+                            )
+                        else:
+                            _log(f"CPA 服务 {svc.name} 没有凭证", 'warning')
+                        continue
+
+                    removed_401 = 0
+                    for item in files:
+                        status_code = _extract_cliproxy_status_code(item)
+                        if status_code not in (401, 403):
+                            continue
+                        name = str(item.get("name", "")).strip()
+                        if not name:
+                            _log("检测到面板标记 401/403 的凭证但缺少名称，已跳过快速剔除", 'warning')
+                            continue
+                        if not _is_cpa_codex_auth_file(item):
+                            _log(f"面板标记 401/403 的凭证 {name} 非 Codex，按策略仅跳过不清理", 'warning')
+                            continue
+                        try:
+                            delete_cliproxy_auth_file(name, svc.api_url, svc.api_token)
+                            removed_401 += 1
+                            _log(f"面板 401/403 快速剔除: {name}", 'warning')
+                        except Exception as e:
+                            _log(f"面板 401/403 快速剔除 {name} 失败: {e}", 'error')
+
+                    _log(f"CPA 服务 {svc.name} 401/403 快速剔除完成，剔除: {removed_401}")
+                except Exception as e:
+                    _log(f"检查 CPA 服务 {svc.id} ({svc.name}) 401/403 快速剔除异常: {e}", 'error')
+    except Exception as e:
+        _log(f"401/403 快速剔除任务异常: {e}", 'error')
+    finally:
+        _is_checking_401 = False
 
 def check_cpa_services_job(main_loop, manual_logs: list = None):
     """定时检查所有启用的 CPA 服务"""
@@ -535,29 +615,29 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
                             remaining_files = []
                             for item in files:
                                 status_code = _extract_cliproxy_status_code(item)
-                                if status_code == 401:
+                                if status_code in (401, 403):
                                     name = str(item.get("name", "")).strip()
                                     if not name:
-                                        _log("检测到面板标记 401 的凭证但缺少名称，已跳过快速剔除", 'warning')
+                                        _log("检测到面板标记 401/403 的凭证但缺少名称，已跳过快速剔除", 'warning')
                                         remaining_files.append(item)
                                         continue
                                     if not _is_cpa_codex_auth_file(item):
-                                        _log(f"面板标记 401 的凭证 {name} 非 Codex，按策略仅跳过不清理", 'warning')
+                                        _log(f"面板标记 401/403 的凭证 {name} 非 Codex，按策略仅跳过不清理", 'warning')
                                         remaining_files.append(item)
                                         continue
                                     try:
                                         delete_cliproxy_auth_file(name, svc.api_url, svc.api_token)
                                         removed_401 += 1
-                                        _log(f"面板 401 快速剔除: {name}", 'warning')
+                                        _log(f"面板 401/403 快速剔除: {name}", 'warning')
                                         continue
                                     except Exception as e:
-                                        _log(f"面板 401 快速剔除 {name} 失败: {e}", 'error')
+                                        _log(f"面板 401/403 快速剔除 {name} 失败: {e}", 'error')
                                         remaining_files.append(item)
                                         continue
                                 remaining_files.append(item)
 
                             if removed_401 > 0:
-                                _log(f"面板 401 快速剔除完成，已剔除 {removed_401} 个，剩余待测 {len(remaining_files)} 个")
+                                _log(f"面板 401/403 快速剔除完成，已剔除 {removed_401} 个，剩余待测 {len(remaining_files)} 个")
                             files = remaining_files
                         
                         has_triggered_early = False
@@ -579,7 +659,7 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
                         
                         if not files:
                             if removed_401 > 0:
-                                _log(f"CPA 服务 {svc.name} 401 快速剔除后无剩余凭证待测", 'warning')
+                                _log(f"CPA 服务 {svc.name} 401/403 快速剔除后无剩余凭证待测", 'warning')
                             else:
                                 _log(f"CPA 服务 {svc.name} 暂无可测凭证", 'warning')
                         else:
@@ -696,8 +776,25 @@ async def _scheduler_loop():
         await asyncio.sleep(interval_min * 60)
 
 
+async def _scheduler_401_loop():
+    """401 快速剔除调度器主循环"""
+    await asyncio.sleep(8) # 启动后延迟 8 秒开始
+    loop = asyncio.get_running_loop()
+    while True:
+        settings = get_settings()
+        try:
+            await loop.run_in_executor(None, check_cpa_services_401_job, loop, None)
+        except Exception as e:
+            logger.error(f"Scheduler 401 loop exception: {e}")
+        interval_min = getattr(settings, "cpa_auto_check_remove_401_interval", 3) or 3
+        if interval_min < 1:
+            interval_min = 1
+        await asyncio.sleep(interval_min * 60)
+
+
 def start_scheduler():
     """启动调度器"""
     logger.info("启动后台调度器，负责定时任务...")
     loop = asyncio.get_event_loop()
     loop.create_task(_scheduler_loop())
+    loop.create_task(_scheduler_401_loop())
