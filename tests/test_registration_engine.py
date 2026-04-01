@@ -762,6 +762,33 @@ def test_oauth_submit_consent_form_uses_workspace_from_cookie_when_html_missing(
     assert code == "code-cookie-ws-1"
 
 
+def test_oauth_get_workspace_id_falls_back_to_authorize_url_page():
+    oauth_auth_url = (
+        "https://auth.openai.com/oauth/authorize?"
+        "client_id=app_xxx&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"
+    )
+    session = QueueSession([
+        (
+            "GET",
+            oauth_auth_url,
+            DummyResponse(
+                status_code=200,
+                text='<script type="application/json">{"default_workspace_id":"ws-auth-1"}</script>',
+                url=oauth_auth_url,
+            ),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+
+    workspace_id = engine._oauth_get_workspace_id(
+        session=session,
+        consent_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        authorize_url=oauth_auth_url,
+    )
+
+    assert workspace_id == "ws-auth-1"
+
+
 def test_register_retries_on_transient_502_and_succeeds(monkeypatch):
     session = QueueSession([
         (

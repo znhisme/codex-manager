@@ -1943,6 +1943,7 @@ class RegistrationEngine:
         self,
         session: cffi_requests.Session,
         consent_url: str = "",
+        authorize_url: str = "",
     ) -> Optional[str]:
         """获取 Workspace ID（OAuth 登录流程）。"""
         try:
@@ -1961,6 +1962,8 @@ class RegistrationEngine:
                         return workspace_id
 
             page_candidates = []
+            if authorize_url:
+                page_candidates.append(authorize_url)
             if consent_url:
                 page_candidates.append(consent_url)
             page_candidates.append(f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent")
@@ -2173,7 +2176,11 @@ class RegistrationEngine:
 
         # 2) 走 workspace / organization 流程
         if not auth_code:
-            workspace_id = self._oauth_get_workspace_id(session, consent_url=consent_url)
+            workspace_id = self._oauth_get_workspace_id(
+                session,
+                consent_url=consent_url,
+                authorize_url=oauth_start.auth_url,
+            )
             if workspace_id:
                 headers = {
                     "referer": consent_url,
