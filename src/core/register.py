@@ -289,6 +289,9 @@ class SignupFormResult:
     response_data: Dict[str, Any] = None
     error_message: str = ""
 
+class OAuthPhoneRequiredError(RuntimeError):
+    """OAuth 流程被手机号校验拦截。"""
+
 class RegistrationEngine:
     def __init__(
         self,
@@ -763,6 +766,53 @@ class RegistrationEngine:
             return True
         return False
 
+    def _is_phone_required(self, url: str = "", text: str = "", page_type: str = "") -> bool:
+        url_lower = (url or "").lower()
+        page_lower = (page_type or "").lower()
+        text_lower = (text or "").lower()
+
+        url_hit = any(key in url_lower for key in (
+            "add-phone",
+            "add_phone",
+            "phone-verification",
+            "phone_verification",
+            "verify-phone",
+            "verify_phone",
+            "/phone",
+            "onboarding",
+        ))
+        page_hit = any(key in page_lower for key in (
+            "phone",
+            "add-phone",
+            "add_phone",
+            "onboarding",
+        ))
+        text_hit = any(key in text_lower for key in (
+            "add-phone",
+            "add_phone",
+            "phone verification",
+            "verify your phone",
+            "phone number",
+            "phone required",
+            "手机号",
+        ))
+
+        return url_hit or page_hit or text_hit
+
+    def _raise_if_phone_required(
+        self,
+        *,
+        url: str = "",
+        text: str = "",
+        page_type: str = "",
+        stage: str = "",
+    ) -> None:
+        if self._is_phone_required(url=url, text=text, page_type=page_type):
+            prefix = f"{stage}：" if stage else ""
+            msg = f"{prefix}检测到需要手机号验证，OAuth 授权被拦截"
+            self._log(msg, "warning")
+            raise OAuthPhoneRequiredError(msg)
+
     def _auth0_submit_identifier(
         self,
         state: str,
@@ -854,6 +904,7 @@ class RegistrationEngine:
             resp = self._auth0_submit_identifier(state, email, extra_fields=hidden, action_url=action_url)
             current_url = str(resp.url)
             html_text = resp.text or ""
+            self._raise_if_phone_required(url=current_url, text=html_text, stage="OAuth 登录(Identifier)")
             if current_url.startswith(redirect_uri):
                 return current_url
 
@@ -866,6 +917,7 @@ class RegistrationEngine:
             resp = self._auth0_submit_password(state, email, password, extra_fields=hidden, action_url=action_url)
             current_url = str(resp.url)
             html_text = resp.text or ""
+            self._raise_if_phone_required(url=current_url, text=html_text, stage="OAuth 登录(Password)")
             if current_url.startswith(redirect_uri):
                 return current_url
 
@@ -873,6 +925,7 @@ class RegistrationEngine:
             if loc:
                 if loc.startswith("/"):
                     loc = urljoin(current_url, loc)
+                self._raise_if_phone_required(url=loc, stage="OAuth 登录(Password 重定向)")
                 if loc.startswith(redirect_uri):
                     return loc
                 current_url = loc
@@ -911,12 +964,14 @@ class RegistrationEngine:
                 allow_redirects=False,
                 impersonate=self.impersonate,
             )
+            self._raise_if_phone_required(url=str(r.url), text=r.text or "", stage="OAuth 重定向")
             if r.status_code in (301, 302, 303, 307, 308):
                 loc = r.headers.get("Location") or r.headers.get("location")
                 if not loc:
                     return None
                 if loc.startswith("/"):
                     loc = urljoin(current, loc)
+                self._raise_if_phone_required(url=loc, stage="OAuth 重定向(Location)")
                 if loc.startswith(redirect_uri):
                     return loc
                 current = loc
@@ -1014,6 +1069,20 @@ class RegistrationEngine:
                 page_type = response_data.get("page", {}).get("type", "")
                 self._log(f"响应页面类型: {page_type}")
 
+                continue_url = str(response_data.get("continue_url") or "")
+                if self._is_phone_required(
+                    url=continue_url,
+                    page_type=page_type,
+                    text=json.dumps(response_data, ensure_ascii=False),
+                ):
+                    self._log("OAuth 授权入口被手机号校验拦截", "warning")
+                    return SignupFormResult(
+                        success=False,
+                        page_type=page_type,
+                        response_data=response_data,
+                        error_message="PHONE_REQUIRED",
+                    )
+
                 is_existing = page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]
                 if is_existing:
                     self._otp_sent_at = time.time()
@@ -1074,6 +1143,20 @@ class RegistrationEngine:
             response_data = response.json()
             page_type = response_data.get("page", {}).get("type", "")
             self._log(f"登录密码响应页面类型: {page_type}")
+
+            continue_url = str(response_data.get("continue_url") or "")
+            if self._is_phone_required(
+                url=continue_url,
+                page_type=page_type,
+                text=json.dumps(response_data, ensure_ascii=False),
+            ):
+                self._log("登录密码阶段被手机号校验拦截", "warning")
+                return SignupFormResult(
+                    success=False,
+                    page_type=page_type,
+                    response_data=response_data,
+                    error_message="PHONE_REQUIRED",
+                )
 
             is_existing = page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]
             if is_existing:
@@ -1251,6 +1334,11 @@ class RegistrationEngine:
             for i in range(max_redirects):
                 self._log(f"重定向 {i+1}/{max_redirects}: {current_url[:100]}...")
                 response = session.get(current_url, allow_redirects=False, timeout=15)
+                self._raise_if_phone_required(
+                    url=str(response.url),
+                    text=response.text or "",
+                    stage="OAuth 重定向链",
+                )
 
                 location = response.headers.get("Location") or ""
                 if response.status_code not in [301, 302, 303, 307, 308]:
@@ -1261,6 +1349,7 @@ class RegistrationEngine:
                     break
 
                 next_url = urljoin(current_url, location)
+                self._raise_if_phone_required(url=next_url, stage="OAuth 重定向链(Location)")
                 if "code=" in next_url and "state=" in next_url:
                     self._log(f"找到回调 URL: {next_url[:100]}...")
                     return next_url
@@ -1290,8 +1379,14 @@ class RegistrationEngine:
                     return _extract_code_from_url(m.group(1))
                 return None
 
+            self._raise_if_phone_required(
+                url=str(resp.url),
+                text=resp.text or "",
+                stage="OAuth 跟随跳转",
+            )
             if resp.status_code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("Location", "")
+                self._raise_if_phone_required(url=loc, stage="OAuth 跟随跳转(Location)")
                 code = _extract_code_from_url(loc)
                 if code:
                     return code
@@ -1319,8 +1414,14 @@ class RegistrationEngine:
                 allow_redirects=False,
                 timeout=30,
             )
+            self._raise_if_phone_required(
+                url=str(resp_consent.url),
+                text=resp_consent.text or "",
+                stage="OAuth Consent",
+            )
             if resp_consent.status_code in (301, 302, 303, 307, 308):
                 loc = resp_consent.headers.get("Location", "")
+                self._raise_if_phone_required(url=loc, stage="OAuth Consent(Location)")
                 auth_code = _extract_code_from_url(loc) or self._oauth_follow_and_extract_code(session, loc)
         except Exception as e:
             m = re.search(r"(https?://localhost[^\s'\"]+)", str(e))
@@ -1345,11 +1446,18 @@ class RegistrationEngine:
                     )
                     if resp_ws.status_code in (301, 302, 303, 307, 308):
                         loc = resp_ws.headers.get("Location", "")
+                        self._raise_if_phone_required(url=loc, stage="OAuth Workspace(Location)")
                         auth_code = _extract_code_from_url(loc) or self._oauth_follow_and_extract_code(session, loc)
                     elif resp_ws.status_code == 200:
                         ws_data = resp_ws.json() if resp_ws.text else {}
                         ws_next = str(ws_data.get("continue_url") or "")
                         ws_page = str(((ws_data.get("page") or {}).get("type")) or "")
+                        self._raise_if_phone_required(
+                            url=ws_next,
+                            page_type=ws_page,
+                            text=json.dumps(ws_data, ensure_ascii=False),
+                            stage="OAuth Workspace",
+                        )
 
                         if "organization" in ws_next or "organization" in ws_page:
                             org_url = ws_next if ws_next.startswith("http") else f"{self.oauth_issuer}{ws_next}"
@@ -1378,16 +1486,20 @@ class RegistrationEngine:
                                 )
                                 if resp_org.status_code in (301, 302, 303, 307, 308):
                                     loc = resp_org.headers.get("Location", "")
+                                    self._raise_if_phone_required(url=loc, stage="OAuth Organization(Location)")
                                     auth_code = _extract_code_from_url(loc) or self._oauth_follow_and_extract_code(session, loc)
                                 elif resp_org.status_code == 200:
                                     org_next = str((resp_org.json() or {}).get("continue_url") or "")
                                     if org_next:
                                         full_next = org_next if org_next.startswith("http") else f"{self.oauth_issuer}{org_next}"
+                                        self._raise_if_phone_required(url=full_next, stage="OAuth Organization")
                                         auth_code = self._oauth_follow_and_extract_code(session, full_next)
                             else:
+                                self._raise_if_phone_required(url=org_url, stage="OAuth Organization")
                                 auth_code = self._oauth_follow_and_extract_code(session, org_url)
                         elif ws_next:
                             full_next = ws_next if ws_next.startswith("http") else f"{self.oauth_issuer}{ws_next}"
+                            self._raise_if_phone_required(url=full_next, stage="OAuth Workspace")
                             auth_code = self._oauth_follow_and_extract_code(session, full_next)
                 except Exception as e:
                     self._log(f"OAuth workspace/organization 处理异常: {e}", "warning")
@@ -1401,10 +1513,16 @@ class RegistrationEngine:
                     allow_redirects=True,
                     timeout=30,
                 )
+                self._raise_if_phone_required(
+                    url=str(resp_fallback.url),
+                    text=resp_fallback.text or "",
+                    stage="OAuth Consent(兜底)",
+                )
                 auth_code = _extract_code_from_url(str(resp_fallback.url))
                 if not auth_code and getattr(resp_fallback, "history", None):
                     for hist in resp_fallback.history:
                         loc = hist.headers.get("Location", "")
+                        self._raise_if_phone_required(url=loc, stage="OAuth Consent(兜底 Location)")
                         auth_code = _extract_code_from_url(loc)
                         if auth_code:
                             break
@@ -1450,34 +1568,45 @@ class RegistrationEngine:
                 scope="openid email profile offline_access",
                 proxy_url=self.proxy_url,
             )
-            oauth_start = oauth_manager.start_oauth()
-            self._log(f"OAuth URL 已生成(复用会话): {oauth_start.auth_url[:80]}...")
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    oauth_start = oauth_manager.start_oauth()
+                    self._log(f"OAuth URL 已生成(复用会话): {oauth_start.auth_url[:80]}...")
 
-            # 去掉 prompt=login，避免强制重新登录
-            try:
-                parsed = urlparse(oauth_start.auth_url)
-                query = parse_qs(parsed.query, keep_blank_values=True)
-                params = {k: (v[-1] if isinstance(v, list) and v else v) for k, v in query.items()}
-                params.pop("prompt", None)
-                authorize_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(params)}"
-            except Exception:
-                authorize_url = oauth_start.auth_url
+                    # 去掉 prompt=login，避免强制重新登录
+                    try:
+                        parsed = urlparse(oauth_start.auth_url)
+                        query = parse_qs(parsed.query, keep_blank_values=True)
+                        params = {k: (v[-1] if isinstance(v, list) and v else v) for k, v in query.items()}
+                        params.pop("prompt", None)
+                        authorize_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(params)}"
+                    except Exception:
+                        authorize_url = oauth_start.auth_url
 
-            callback_url = self._follow_oauth_redirect(
-                authorize_url,
-                oauth_start.redirect_uri,
-                allow_login=False,
-            )
-            if not callback_url:
-                self._log("复用会话未拿到 OAuth 回调", "warning")
-                return None
+                    callback_url = self._follow_oauth_redirect(
+                        authorize_url,
+                        oauth_start.redirect_uri,
+                        allow_login=False,
+                    )
+                    if not callback_url:
+                        self._log("复用会话未拿到 OAuth 回调", "warning")
+                        continue
 
-            token_info = self._oauth_handle_callback(oauth_manager, oauth_start, callback_url)
-            if not token_info:
-                return None
+                    token_info = self._oauth_handle_callback(oauth_manager, oauth_start, callback_url)
+                    if not token_info:
+                        self._log("复用会话处理 OAuth 回调失败，准备重试", "warning")
+                        continue
 
-            self._oauth_session_token = self._get_session_cookie()
-            return token_info
+                    self._oauth_session_token = self._get_session_cookie()
+                    return token_info
+                except OAuthPhoneRequiredError:
+                    self._log(
+                        f"复用会话遇到手机号校验拦截，重新获取 OAuth URL 重试 ({attempt}/{max_attempts})",
+                        "warning",
+                    )
+                    if attempt >= max_attempts:
+                        return None
 
         except Exception as e:
             self._log(f"复用会话 OAuth 失败: {e}", "warning")
@@ -1486,7 +1615,6 @@ class RegistrationEngine:
     def _get_oauth_tokens_via_login_flow(self) -> Optional[Dict[str, Any]]:
         """使用旧版 OAuth 登录流程获取 Token（含 refresh_token）。"""
         try:
-            self._log("尝试 OAuth 登录流程获取 Token")
             oauth_manager = OAuthManager(
                 client_id=self.oauth_client_id,
                 auth_url=f"{self.oauth_issuer}/oauth/authorize",
@@ -1495,55 +1623,95 @@ class RegistrationEngine:
                 scope="openid email profile offline_access",
                 proxy_url=self.proxy_url,
             )
-            oauth_start = oauth_manager.start_oauth()
-            self._log(f"OAuth URL 已生成: {oauth_start.auth_url[:80]}...")
+            max_attempts = 3
+            last_error = ""
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    self._log(f"尝试 OAuth 登录流程获取 Token（第 {attempt}/{max_attempts} 次）")
+                    oauth_start = oauth_manager.start_oauth()
+                    self._log(f"OAuth URL 已生成: {oauth_start.auth_url[:80]}...")
 
-            http_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
-            session = http_client.session
+                    http_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
+                    session = http_client.session
 
-            did = self._oauth_get_device_id(session, oauth_start.auth_url)
-            if not did:
-                return None
+                    did = self._oauth_get_device_id(session, oauth_start.auth_url)
+                    if not did:
+                        last_error = "获取 Device ID 失败"
+                        self._log(last_error, "warning")
+                        continue
 
-            sen_token = http_client.check_sentinel(did)
-            if not sen_token:
-                self._log("Sentinel 校验失败，尝试继续 OAuth 登录流程", "warning")
+                    sen_token = http_client.check_sentinel(did)
+                    if not sen_token:
+                        self._log("Sentinel 校验失败，尝试继续 OAuth 登录流程", "warning")
 
-            login_start = self._oauth_submit_login_start(session, did, sen_token)
-            if not login_start.success:
-                return None
+                    login_start = self._oauth_submit_login_start(session, did, sen_token)
+                    if not login_start.success:
+                        if login_start.error_message == "PHONE_REQUIRED":
+                            raise OAuthPhoneRequiredError("登录入口需要手机号验证")
+                        last_error = f"登录入口失败: {login_start.error_message or 'unknown'}"
+                        self._log(last_error, "warning")
+                        continue
 
-            if login_start.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
-                password_result = self._oauth_submit_login_password(session)
-                if not password_result.success or not password_result.is_existing_account:
-                    return None
-            elif login_start.page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
-                self._log("已进入验证码页面，跳过密码步骤")
-            else:
-                self._log(f"登录入口未进入预期页面: {login_start.page_type}", "warning")
-                return None
+                    if login_start.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
+                        password_result = self._oauth_submit_login_password(session)
+                        if not password_result.success or not password_result.is_existing_account:
+                            if password_result.error_message == "PHONE_REQUIRED":
+                                raise OAuthPhoneRequiredError("登录密码阶段需要手机号验证")
+                            last_error = f"登录密码阶段未进入验证码页面: {password_result.page_type or 'unknown'}"
+                            self._log(last_error, "warning")
+                            continue
+                    elif login_start.page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+                        self._log("已进入验证码页面，跳过密码步骤")
+                    else:
+                        if self._is_phone_required(page_type=login_start.page_type):
+                            raise OAuthPhoneRequiredError("登录入口需要手机号验证")
+                        last_error = f"登录入口未进入预期页面: {login_start.page_type}"
+                        self._log(last_error, "warning")
+                        continue
 
-            self._log("获取邮箱验证码")
-            code = self.wait_for_verification_email(timeout=120)
-            if not code:
-                return None
+                    self._log("获取邮箱验证码")
+                    code = self.wait_for_verification_email(timeout=120)
+                    if not code:
+                        last_error = "获取邮箱验证码失败"
+                        self._log(last_error, "warning")
+                        continue
 
-            self._log("校验邮箱验证码")
-            if not self._oauth_validate_verification_code(session, code):
-                return None
+                    self._log("校验邮箱验证码")
+                    if not self._oauth_validate_verification_code(session, code):
+                        last_error = "验证码校验失败"
+                        self._log(last_error, "warning")
+                        continue
 
-            auth_code = self._oauth_exchange_auth_code(session, oauth_start)
-            if not auth_code:
-                self._log("未能从 OAuth consent 流程提取 code", "error")
-                return None
+                    auth_code = self._oauth_exchange_auth_code(session, oauth_start)
+                    if not auth_code:
+                        self._log("未能从 OAuth consent 流程提取 code", "error")
+                        last_error = "未能从 OAuth consent 流程提取 code"
+                        continue
 
-            callback_url = f"{oauth_start.redirect_uri}?code={auth_code}&state={oauth_start.state}"
-            token_info = self._oauth_handle_callback(oauth_manager, oauth_start, callback_url)
-            if not token_info:
-                return None
+                    callback_url = f"{oauth_start.redirect_uri}?code={auth_code}&state={oauth_start.state}"
+                    token_info = self._oauth_handle_callback(oauth_manager, oauth_start, callback_url)
+                    if not token_info:
+                        last_error = "OAuth 回调处理失败"
+                        self._log(last_error, "warning")
+                        continue
 
-            self._oauth_session_token = session.cookies.get("__Secure-next-auth.session-token") or ""
-            return token_info
+                    self._oauth_session_token = session.cookies.get("__Secure-next-auth.session-token") or ""
+                    return token_info
+                except OAuthPhoneRequiredError:
+                    self._log(
+                        f"OAuth 登录流程被手机号校验拦截，重新获取 OAuth URL 重试 ({attempt}/{max_attempts})",
+                        "warning",
+                    )
+                    if attempt >= max_attempts:
+                        return None
+                except Exception as e:
+                    last_error = str(e)
+                    self._log(f"OAuth 登录流程异常: {e}，准备重试", "warning")
+                    continue
+
+            if last_error:
+                self._log(f"OAuth 登录流程最终失败: {last_error}", "warning")
+            return None
 
         except Exception as e:
             self._log(f"OAuth 登录流程失败: {e}", "warning")
@@ -1684,19 +1852,8 @@ class RegistrationEngine:
                     token_source = "oauth"
                     result.session_token = self._oauth_session_token or self._get_session_cookie()
                 else:
-                    self._log("OAuth Token 获取失败，尝试回退 Session 提取", "warning")
-                    tokens = self.get_chatgpt_session_tokens()
-                    if tokens and tokens.get("access_token"):
-                        self._log("Session Token 提取成功（OAuth 回退）")
-                        result.access_token = tokens["access_token"]
-                        result.refresh_token = tokens["refresh_token"]
-                        result.id_token = tokens["id_token"]
-                        result.account_id = tokens.get("account_id") or result.account_id
-                        result.success = True
-                        token_source = "session_fallback"
-                        result.session_token = self._get_session_cookie()
-                    else:
-                        result.error_message = "OAuth 与 Session Token 均提取失败"
+                    self._log("OAuth Token 获取失败（OAuth 模式不回退 Session）", "warning")
+                    result.error_message = "OAuth Token 获取失败"
             else:
                 self._log("尝试从 ChatGPT Session 提取 Token")
                 tokens = self.get_chatgpt_session_tokens()

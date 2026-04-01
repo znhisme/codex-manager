@@ -211,58 +211,72 @@ class BrowserRegistrationEngine:
             return False
 
     def _handle_oauth_relogin(self, page) -> bool:
-        """处理 OAuth 再次登录流程（输入邮箱/密码/验证码）。"""
+        """处理 OAuth 再次登录流程（输入邮箱/密码/验证码及打回错误重试）。"""
         handled = False
         try:
-            if page.locator("input[type='email']").count() > 0 and page.locator("input[type='email']").first.is_visible():
-                self._log("检测到 OAuth 登录页，填写邮箱...", "warning")
-                page.fill("input[type='email']", self.email)
-                page.click("button[type='submit']")
-                handled = True
-                self._random_delay(1.0, 2.0)
-
-            if page.locator("input[type='password']").count() > 0 and page.locator("input[type='password']").first.is_visible():
-                self._log("OAuth 登录页要求密码，自动填写...", "warning")
-                page.fill("input[type='password']", self.password)
-                page.click("button[type='submit']")
-                handled = True
-                self._random_delay(1.0, 2.0)
-
-            is_otp = page.locator("input[name='code']").is_visible() or page.locator("input[data-index='0']").is_visible()
-            if is_otp:
-                self._otp_sent_at = time.time()
-                self._log("OAuth 登录需要邮箱验证码，开始获取...", "warning")
-                email_id = self.email_info.get("service_id") if self.email_info else None
-                otp_code = self.email_service.get_verification_code(
-                    email=self.email,
-                    email_id=email_id,
-                    timeout=120,
-                    pattern=OTP_CODE_PATTERN,
-                    otp_sent_at=self._otp_sent_at,
-                )
-                if otp_code:
-                    if page.locator("input[data-index='0']").count() > 0:
-                        for i, char in enumerate(otp_code):
-                            page.fill(f"input[data-index='{i}']", char)
-                    elif page.locator("input[name='code']").count() > 0:
-                        page.fill("input[name='code']", otp_code)
-                        page.click("button[type='submit']")
+            # 使用循环应对多步可能出现的超时错误重试
+            for _ in range(4):
+                step_acted = False
+                
+                # 处理 Operation Timed Out 错误重试
+                retry_loc = page.locator("button:has-text('Retry'), a:has-text('Retry'), button:has-text('Try again'), a:has-text('Try again'), button:has-text('重试'), a:has-text('重试'), button[data-dd-action-name='Try again']")
+                if retry_loc.count() > 0 and retry_loc.first.is_visible():
+                    self._log("检测到 OAuth 登录页显示 Operation timed out 或错误，直接点击重试...", "warning")
+                    retry_loc.first.click()
+                    step_acted = True
                     handled = True
-                    self._random_delay(1.0, 2.0)
+                    self._random_delay(2.0, 3.0)
+
+
+                if page.locator("input[type='email']").count() > 0 and page.locator("input[type='email']").first.is_visible():
+                    self._log("检测到 OAuth 登录页，填写邮箱...", "warning")
+                    page.fill("input[type='email']", self.email)
+                    page.click("button[type='submit']")
+                    step_acted = True
+                    handled = True
+                    self._random_delay(1.5, 3.0)
+
+                if page.locator("input[type='password']").count() > 0 and page.locator("input[type='password']").first.is_visible():
+                    self._log("OAuth 登录页要求密码，自动填写...", "warning")
+                    page.fill("input[type='password']", self.password)
+                    page.click("button[type='submit']")
+                    step_acted = True
+                    handled = True
+                    self._random_delay(1.5, 3.0)
+
+                is_otp = page.locator("input[name='code']").is_visible() or page.locator("input[data-index='0']").is_visible()
+                if is_otp:
+                    self._otp_sent_at = time.time()
+                    self._log("OAuth 登录需要邮箱验证码，开始获取...", "warning")
+                    email_id = self.email_info.get("service_id") if self.email_info else None
+                    otp_code = self.email_service.get_verification_code(
+                        email=self.email,
+                        email_id=email_id,
+                        timeout=120,
+                        pattern=OTP_CODE_PATTERN,
+                        otp_sent_at=self._otp_sent_at,
+                    )
+                    if otp_code:
+                        if page.locator("input[data-index='0']").count() > 0:
+                            for i, char in enumerate(otp_code):
+                                page.fill(f"input[data-index='{i}']", char)
+                        elif page.locator("input[name='code']").count() > 0:
+                            page.fill("input[name='code']", otp_code)
+                            page.click("button[type='submit']")
+                        step_acted = True
+                        handled = True
+                        self._random_delay(1.0, 2.0)
+                
+                # 如果当前循环没有做任何操作，则认为页面已经进入了等待跳转状态，跳出
+                if not step_acted:
+                    break
         except Exception as e:
             self._log(f"OAuth 再登录处理异常: {e}", "warning")
         return handled
 
     def _build_oauth_authorize_url(self, auth_url: str) -> str:
-        """移除 prompt=login，优先复用已登录会话。"""
-        try:
-            parsed = urlparse(auth_url)
-            query = parse_qs(parsed.query, keep_blank_values=True)
-            params = {k: (v[-1] if isinstance(v, list) and v else v) for k, v in query.items()}
-            params.pop("prompt", None)
-            return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(params)}"
-        except Exception:
-            return auth_url
+        """保留 prompt=login，强制重新登录（不复用已登录会话）。"""
+        return auth_url
 
     def _capture_oauth_callback(self, page, timeout_ms: int = 20000) -> str:
         """通过导航与请求监听捕获 OAuth 回调 URL。"""
@@ -678,59 +692,77 @@ class BrowserRegistrationEngine:
                         if self.skip_oauth:
                             self._log("已配置跳过 OAuth 授权流程 (BROWSER_SKIP_OAUTH=1)", "warning")
                         else:
-                            try:
-                                from .openai.oauth import generate_oauth_url, submit_callback_url
-                                self._log("启动最后一步：获取正式的 OAuth Refresh Token！")
-                                oauth_info = generate_oauth_url()
-                                authorize_url = self._build_oauth_authorize_url(oauth_info.auth_url)
-                                page.goto(authorize_url)
-                                self._random_delay(1.0, 2.0)
-                                self._handle_oauth_relogin(page)
+                            from .openai.oauth import generate_oauth_url, submit_callback_url
+                            oauth_success = False
+                            # 暂时一直重复获取 OAuth 重新登录直到获取到 refresh token 为止
+                            for attempt in range(30):
+                                try:
+                                    self._log(f"启动获取正式的 OAuth Refresh Token！（尝试次数: {attempt + 1}）")
+                                    oauth_info = generate_oauth_url()
+                                    authorize_url = self._build_oauth_authorize_url(oauth_info.auth_url)
+                                    page.goto(authorize_url)
+                                    self._random_delay(1.0, 2.0)
+                                    self._handle_oauth_relogin(page)
 
-                                callback_url = self._capture_oauth_callback(page, timeout_ms=20000)
-                                if not callback_url:
-                                    self._log("试图点击授权界面的 Continue/Allow 等确认许可键...")
-                                    btn_locator = page.locator("button:has-text('Allow'), button:has-text('Authorize'), button:has-text('Continue'), div[role='button']")
-                                    if btn_locator.count() > 0:
-                                        for i in range(btn_locator.count()):
-                                            if btn_locator.nth(i).is_visible():
-                                                btn_locator.nth(i).click()
-                                                break
+                                    callback_url = self._capture_oauth_callback(page, timeout_ms=20000)
+                                    if not callback_url:
+                                        self._log("试图点击授权界面的 Continue/Allow 等确认许可键...")
+                                        btn_locator = page.locator("button:has-text('Allow'), button:has-text('Authorize'), button:has-text('Continue'), div[role='button']")
+                                        if btn_locator.count() > 0:
+                                            for i in range(btn_locator.count()):
+                                                if btn_locator.nth(i).is_visible():
+                                                    btn_locator.nth(i).click()
+                                                    break
+                                        else:
+                                            self._handle_oauth_relogin(page)
+
+                                        callback_url = self._capture_oauth_callback(page, timeout_ms=15000)
+
+                                    if not callback_url:
+                                        body_text = page.locator("body").inner_text()[:400]
+                                        self._log(f"授权回调未能自动触发，当前页面内容卡在: {body_text}", "warning")
+                                        if "add-phone" in page.url or "onboarding" in page.url:
+                                            self._log("检测到 OAuth 被拦截到 add-phone 页面，触发并开始下一次 OA 重新登录！", "warning")
+                                            continue
+                                            
+                                        if self._maybe_refresh(page, "OAuth 授权未跳转", refresh_state):
+                                            self._handle_oauth_relogin(page)
+                                            callback_url = self._capture_oauth_callback(page, timeout_ms=10000)
+
+                                    final_oauth_url = callback_url or page.url
+                                    if "code=" not in final_oauth_url or "state=" not in final_oauth_url:
+                                        if "add-phone" in final_oauth_url or "onboarding" in final_oauth_url:
+                                            self._log("最终因为跳到 add-phone 页面，重新触发 OA 登录...", "warning")
+                                            continue
+                                        raise RuntimeError("未捕捉到 OAuth 回调 code/state")
+
+                                    self._log("成功捕捉到 Code，正在调用接口进行兑换...")
+                                    tokens_json = submit_callback_url(
+                                        callback_url=final_oauth_url,
+                                        expected_state=oauth_info.state,
+                                        code_verifier=oauth_info.code_verifier,
+                                        proxy_url=self.proxy_url
+                                    )
+                                    import json as token_json
+                                    oauth_tokens = token_json.loads(tokens_json)
+                                    if oauth_tokens.get("access_token") and oauth_tokens.get("refresh_token"):
+                                        result.access_token = oauth_tokens["access_token"]
+                                        result.refresh_token = oauth_tokens["refresh_token"]
+                                        result.id_token = oauth_tokens.get("id_token", "")
+                                        result.metadata["token_source"] = "browser_oauth"
+                                        self._log("🎉 正式授权 Token (附带无限续期 Refresh Token) 提取成功！")
+                                        oauth_success = True
+                                        break
                                     else:
-                                        self._handle_oauth_relogin(page)
-
-                                    callback_url = self._capture_oauth_callback(page, timeout_ms=15000)
-
-                                if not callback_url:
-                                    body_text = page.locator("body").inner_text()[:400]
-                                    self._log(f"授权回调未能自动触发，当前页面内容卡在: {body_text}", "warning")
-                                    if self._maybe_refresh(page, "OAuth 授权未跳转", refresh_state):
-                                        self._handle_oauth_relogin(page)
-                                        callback_url = self._capture_oauth_callback(page, timeout_ms=10000)
-
-                                final_oauth_url = callback_url or page.url
-                                if "code=" not in final_oauth_url or "state=" not in final_oauth_url:
-                                    raise RuntimeError("未捕捉到 OAuth 回调 code/state")
-
-                                self._log("成功捕捉到 Code，正在调用接口进行兑换...")
-                                tokens_json = submit_callback_url(
-                                    callback_url=final_oauth_url,
-                                    expected_state=oauth_info.state,
-                                    code_verifier=oauth_info.code_verifier,
-                                    proxy_url=self.proxy_url
-                                )
-                                import json as token_json
-                                oauth_tokens = token_json.loads(tokens_json)
-                                if oauth_tokens.get("access_token") and oauth_tokens.get("refresh_token"):
-                                    result.access_token = oauth_tokens["access_token"]
-                                    result.refresh_token = oauth_tokens["refresh_token"]
-                                    result.id_token = oauth_tokens.get("id_token", "")
-                                    result.metadata["token_source"] = "browser_oauth"
-                                    self._log("🎉 正式授权 Token (附带无限续期 Refresh Token) 提取成功！")
-                                else:
-                                    self._log("未能获取到完整的 OAuth token 信息", "warning")
-                            except Exception as oauth_e:
-                                self._log(f"附加 OAuth 授权流程被拦截 (最初获得的 Session Key 可能仍然可用): {oauth_e}", "warning")
+                                        self._log("未能获取到完整的 OAuth token 信息", "warning")
+                                except Exception as oauth_e:
+                                    self._log(f"附加 OAuth 授权流程被拦截或发生异常: {oauth_e}", "warning")
+                                    if "add-phone" in page.url or "onboarding" in page.url:
+                                        self._log("留在 add-phone 页面，触发下一次尝试...", "warning")
+                                        continue
+                                        
+                            if not oauth_success:
+                                self._log("达到最大 OAuth 重试次数，获取 Refresh Token 失败。", "warning")
                     else:
                          self._log("注册似乎完成了，但未能从 session 获取到正确的 access_token。", "error")
                          result.error_message = "没有在最终页面提取到 accessToken"
