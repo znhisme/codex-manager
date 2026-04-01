@@ -1000,6 +1000,7 @@ class RegistrationEngine:
         try:
             patterns = (
                 r'name=["\']workspace_id["\'][^>]*value=["\']([^"\']+)["\']',
+                r'value=["\']([^"\']+)["\'][^>]*name=["\']workspace_id["\']',
                 r'"workspace_id"\s*:\s*"([^"]+)"',
                 r'"workspaceId"\s*:\s*"([^"]+)"',
             )
@@ -1108,6 +1109,7 @@ class RegistrationEngine:
         try:
             action_url: Optional[str] = None
             payload: Dict[str, str] = {}
+            workspace_id_hint = self._extract_workspace_id_from_html(html_text) or ""
 
             forms = re.findall(r"<form[^>]*>.*?</form>", html_text, flags=re.IGNORECASE | re.DOTALL)
             if forms:
@@ -1136,6 +1138,8 @@ class RegistrationEngine:
                         score += 30
                     if action_raw:
                         score += 10
+                    if candidate_payload.get("workspace_id"):
+                        score += 120
 
                     ranked_forms.append((score, candidate_action, candidate_payload, submit_payload))
 
@@ -1169,6 +1173,16 @@ class RegistrationEngine:
             needs_default_action = "/api/accounts/authorize/continue" in action_path
             if needs_default_action and "action" not in payload:
                 payload["action"] = "default"
+            if "workspace_id" not in payload and workspace_id_hint:
+                payload["workspace_id"] = workspace_id_hint
+
+            if "/sign-in-with-chatgpt/codex/consent" in action_path and workspace_id_hint:
+                self._log("Consent 检测到 workspace_id，优先走 workspace/select", "info")
+                ws_continue_url = self._oauth_select_workspace(session, workspace_id_hint)
+                if ws_continue_url:
+                    code = self._oauth_follow_and_extract_code(session, ws_continue_url)
+                    if code:
+                        return code
 
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -1185,7 +1199,7 @@ class RegistrationEngine:
             )
 
             self._log(f"Consent 表单提交状态: {resp.status_code}, URL: {str(resp.url)[:120]}...")
-            workspace_id_hint = str(payload.get("workspace_id") or "").strip()
+            workspace_id_hint = str(payload.get("workspace_id") or workspace_id_hint or "").strip()
 
             self._raise_if_phone_required(
                 url=str(resp.url),

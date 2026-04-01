@@ -687,3 +687,16 @@ def test_extract_navigation_url_skips_static_asset_and_prefers_auth_url():
         base_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
     )
     assert nav_url == "https://auth.openai.com/oauth/authorize/resume?flow=1"
+
+
+def test_extract_workspace_id_from_html_supports_value_before_name():
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+    html_text = """
+    <form method="post" action="/sign-in-with-chatgpt/codex/consent">
+      <input id="_r_1f_-workspace_id" form="_r_1f_" type="hidden"
+             value="ws-order-1" name="workspace_id">
+      <button type="submit">继续</button>
+    </form>
+    """
+    workspace_id = engine._extract_workspace_id_from_html(html_text)
+    assert workspace_id == "ws-order-1"
