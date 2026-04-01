@@ -50,6 +50,17 @@ class RegistrationSettings(BaseModel):
     sleep_min: int = 5
     sleep_max: int = 30
     global_concurrency: int = 1
+    oauth_rate_limit_cooldown_seconds: int = 900
+    oauth_rate_limit_backoff_base_seconds: int = 6
+    oauth_rate_limit_backoff_max_seconds: int = 60
+    batch_oauth_max_concurrency: int = 1
+    batch_oauth_start_jitter_min_seconds: int = 0
+    batch_oauth_start_jitter_max_seconds: int = 5
+    oauth_pending_enabled: bool = True
+    oauth_pending_poll_interval_seconds: int = 60
+    oauth_pending_max_attempts: int = 8
+    oauth_pending_retry_base_seconds: int = 60
+    oauth_pending_retry_max_seconds: int = 1800
 
 
 class WebUISettings(BaseModel):
@@ -95,6 +106,17 @@ async def get_all_settings():
             "sleep_min": settings.registration_sleep_min,
             "sleep_max": settings.registration_sleep_max,
             "global_concurrency": settings.global_concurrency,
+            "oauth_rate_limit_cooldown_seconds": settings.oauth_rate_limit_cooldown_seconds,
+            "oauth_rate_limit_backoff_base_seconds": settings.oauth_rate_limit_backoff_base_seconds,
+            "oauth_rate_limit_backoff_max_seconds": settings.oauth_rate_limit_backoff_max_seconds,
+            "batch_oauth_max_concurrency": settings.batch_oauth_max_concurrency,
+            "batch_oauth_start_jitter_min_seconds": settings.batch_oauth_start_jitter_min_seconds,
+            "batch_oauth_start_jitter_max_seconds": settings.batch_oauth_start_jitter_max_seconds,
+            "oauth_pending_enabled": settings.oauth_pending_enabled,
+            "oauth_pending_poll_interval_seconds": settings.oauth_pending_poll_interval_seconds,
+            "oauth_pending_max_attempts": settings.oauth_pending_max_attempts,
+            "oauth_pending_retry_base_seconds": settings.oauth_pending_retry_base_seconds,
+            "oauth_pending_retry_max_seconds": settings.oauth_pending_retry_max_seconds,
         },
         "webui": {
             "host": settings.webui_host,
@@ -211,6 +233,17 @@ async def get_registration_settings():
         "sleep_min": settings.registration_sleep_min,
         "sleep_max": settings.registration_sleep_max,
         "global_concurrency": settings.global_concurrency,
+        "oauth_rate_limit_cooldown_seconds": settings.oauth_rate_limit_cooldown_seconds,
+        "oauth_rate_limit_backoff_base_seconds": settings.oauth_rate_limit_backoff_base_seconds,
+        "oauth_rate_limit_backoff_max_seconds": settings.oauth_rate_limit_backoff_max_seconds,
+        "batch_oauth_max_concurrency": settings.batch_oauth_max_concurrency,
+        "batch_oauth_start_jitter_min_seconds": settings.batch_oauth_start_jitter_min_seconds,
+        "batch_oauth_start_jitter_max_seconds": settings.batch_oauth_start_jitter_max_seconds,
+        "oauth_pending_enabled": settings.oauth_pending_enabled,
+        "oauth_pending_poll_interval_seconds": settings.oauth_pending_poll_interval_seconds,
+        "oauth_pending_max_attempts": settings.oauth_pending_max_attempts,
+        "oauth_pending_retry_base_seconds": settings.oauth_pending_retry_base_seconds,
+        "oauth_pending_retry_max_seconds": settings.oauth_pending_retry_max_seconds,
     }
 
 
@@ -224,6 +257,17 @@ async def update_registration_settings(request: RegistrationSettings):
         registration_sleep_min=request.sleep_min,
         registration_sleep_max=request.sleep_max,
         global_concurrency=request.global_concurrency,
+        oauth_rate_limit_cooldown_seconds=request.oauth_rate_limit_cooldown_seconds,
+        oauth_rate_limit_backoff_base_seconds=request.oauth_rate_limit_backoff_base_seconds,
+        oauth_rate_limit_backoff_max_seconds=request.oauth_rate_limit_backoff_max_seconds,
+        batch_oauth_max_concurrency=request.batch_oauth_max_concurrency,
+        batch_oauth_start_jitter_min_seconds=request.batch_oauth_start_jitter_min_seconds,
+        batch_oauth_start_jitter_max_seconds=request.batch_oauth_start_jitter_max_seconds,
+        oauth_pending_enabled=request.oauth_pending_enabled,
+        oauth_pending_poll_interval_seconds=request.oauth_pending_poll_interval_seconds,
+        oauth_pending_max_attempts=request.oauth_pending_max_attempts,
+        oauth_pending_retry_base_seconds=request.oauth_pending_retry_base_seconds,
+        oauth_pending_retry_max_seconds=request.oauth_pending_retry_max_seconds,
     )
 
     return {"success": True, "message": "注册设置已更新"}

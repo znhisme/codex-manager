@@ -10,7 +10,7 @@ import secrets
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from curl_cffi import requests as cffi_requests
 
@@ -125,6 +125,120 @@ def _to_int(v: Any) -> int:
         return int(v)
     except (TypeError, ValueError):
         return 0
+
+
+def _normalize_claim_list(value: Any) -> List[str]:
+    """将 JWT claim 规范化为字符串列表。"""
+    if isinstance(value, (list, tuple, set)):
+        result: List[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                result.append(text)
+        return result
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def is_oauth_token_source(token_source: Optional[str]) -> bool:
+    """判断 token_source 是否属于 OAuth 授权来源。"""
+    source = str(token_source or "").strip().lower()
+    return source in {"oauth", "browser_oauth", "codex_oauth"}
+
+
+def extract_token_binding_profile(
+    *,
+    access_token: str = "",
+    id_token: str = "",
+    scope: str = "",
+) -> Dict[str, Any]:
+    """
+    提取 Token 绑定信息（client_id/audience/scope）。
+
+    说明：
+    - 优先从 id_token 读取 claim；
+    - id_token 不足时回退到 access_token；
+    - 不验证签名，仅做本地结构校验与字段提取。
+    """
+    id_claims = _jwt_claims_no_verify(id_token)
+    access_claims = _jwt_claims_no_verify(access_token)
+
+    issued_client_id = ""
+    for candidate in (
+        id_claims.get("azp"),
+        id_claims.get("client_id"),
+        access_claims.get("azp"),
+        access_claims.get("client_id"),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            issued_client_id = text
+            break
+
+    audiences = _normalize_claim_list(id_claims.get("aud"))
+    if not audiences:
+        audiences = _normalize_claim_list(access_claims.get("aud"))
+
+    scope_text = str(
+        scope
+        or id_claims.get("scope")
+        or access_claims.get("scope")
+        or access_claims.get("scp")
+        or ""
+    ).strip()
+
+    return {
+        "issued_client_id": issued_client_id,
+        "audiences": audiences,
+        "scope": scope_text,
+        "id_claims": id_claims,
+        "access_claims": access_claims,
+    }
+
+
+def validate_token_binding(
+    *,
+    expected_client_id: str,
+    access_token: str = "",
+    id_token: str = "",
+    refresh_token: str = "",
+    token_source: str = "",
+    scope: str = "",
+    require_refresh_token: bool = False,
+    require_oauth_source: bool = False,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    校验 Token 与目标 OAuth Client 的绑定关系。
+
+    Returns:
+        (is_valid, reason, profile)
+    """
+    profile = extract_token_binding_profile(
+        access_token=access_token,
+        id_token=id_token,
+        scope=scope,
+    )
+
+    if require_refresh_token and not str(refresh_token or "").strip():
+        return False, "缺少 refresh_token", profile
+
+    source = str(token_source or "").strip().lower()
+    if require_oauth_source and source and not is_oauth_token_source(source):
+        return False, f"token_source={source} 非 OAuth 来源", profile
+
+    expected = str(expected_client_id or "").strip()
+    if not expected:
+        return True, "", profile
+
+    issued_client_id = str(profile.get("issued_client_id") or "").strip()
+    if issued_client_id and issued_client_id != expected:
+        return False, f"token client_id 不匹配: {issued_client_id}", profile
+
+    audiences = profile.get("audiences") or []
+    if audiences and (expected not in audiences) and not issued_client_id:
+        return False, f"token audience 不匹配: {audiences}", profile
+
+    return True, "", profile
 
 
 def _post_form(
@@ -284,7 +398,19 @@ def submit_callback_url(
     access_token = (token_resp.get("access_token") or "").strip()
     refresh_token = (token_resp.get("refresh_token") or "").strip()
     id_token = (token_resp.get("id_token") or "").strip()
+    token_scope = str(token_resp.get("scope") or "").strip()
     expires_in = _to_int(token_resp.get("expires_in"))
+
+    profile_ok, profile_reason, profile = validate_token_binding(
+        expected_client_id=client_id,
+        access_token=access_token,
+        id_token=id_token,
+        refresh_token=refresh_token,
+        scope=token_scope,
+        require_refresh_token=True,
+    )
+    if not profile_ok:
+        raise RuntimeError(f"oauth token 绑定校验失败: {profile_reason}")
 
     claims = _jwt_claims_no_verify(id_token)
     email = str(claims.get("email") or "").strip()
@@ -306,6 +432,9 @@ def submit_callback_url(
         "email": email,
         "type": "codex",
         "expired": expired_rfc3339,
+        "issued_client_id": str(profile.get("issued_client_id") or "").strip(),
+        "token_audience": profile.get("audiences") or [],
+        "token_scope": token_scope or str(profile.get("scope") or "").strip(),
     }
 
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))

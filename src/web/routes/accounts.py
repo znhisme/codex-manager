@@ -16,7 +16,12 @@ from ...config.constants import AccountStatus
 from ...config.settings import get_settings
 from ...core.openai.token_refresh import refresh_account_token as do_refresh
 from ...core.openai.token_refresh import validate_account_token as do_validate
-from ...core.upload.cpa_upload import generate_token_json, batch_upload_to_cpa, upload_to_cpa
+from ...core.upload.cpa_upload import (
+    generate_token_json,
+    batch_upload_to_cpa,
+    upload_to_cpa,
+    validate_codex_account_for_upload,
+)
 from ...core.upload.team_manager_upload import upload_to_team_manager, batch_upload_to_team_manager
 from ...core.upload.sub2api_upload import batch_upload_to_sub2api, upload_to_sub2api
 
@@ -461,16 +466,34 @@ async def export_accounts_sub2api(request: BatchExportRequest):
             request.status_filter, request.email_service_filter, request.search_filter
         )
         accounts = db.query(Account).filter(Account.id.in_(ids)).all()
+        expected_client_id = str(get_settings().openai_client_id or "").strip()
+        valid_accounts = []
+        skipped = []
+        for acc in accounts:
+            valid, reason = validate_codex_account_for_upload(
+                acc,
+                expected_client_id=expected_client_id,
+            )
+            if valid:
+                valid_accounts.append(acc)
+            else:
+                skipped.append(f"{acc.email}: {reason}")
+
+        if not valid_accounts:
+            detail = skipped[0] if skipped else "没有可导出的账号"
+            raise HTTPException(status_code=400, detail=f"所选账号均未通过授权校验：{detail}")
+        if skipped:
+            logger.warning("Sub2API 导出跳过 %d 个未授权账号，示例：%s", len(skipped), skipped[0])
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         payload = {
             "proxies": [],
-            "accounts": [make_account_entry(acc) for acc in accounts]
+            "accounts": [make_account_entry(acc) for acc in valid_accounts]
         }
         content = json.dumps(payload, ensure_ascii=False, indent=2)
 
-        if len(accounts) == 1:
-            filename = f"{accounts[0].email}_sub2api.json"
+        if len(valid_accounts) == 1:
+            filename = f"{valid_accounts[0].email}_sub2api.json"
         else:
             filename = f"sub2api_tokens_{timestamp}.json"
 
@@ -490,12 +513,30 @@ async def export_accounts_cpa(request: BatchExportRequest):
             request.status_filter, request.email_service_filter, request.search_filter
         )
         accounts = db.query(Account).filter(Account.id.in_(ids)).all()
+        expected_client_id = str(get_settings().openai_client_id or "").strip()
+        valid_accounts = []
+        skipped = []
+        for acc in accounts:
+            valid, reason = validate_codex_account_for_upload(
+                acc,
+                expected_client_id=expected_client_id,
+            )
+            if valid:
+                valid_accounts.append(acc)
+            else:
+                skipped.append(f"{acc.email}: {reason}")
+
+        if not valid_accounts:
+            detail = skipped[0] if skipped else "没有可导出的账号"
+            raise HTTPException(status_code=400, detail=f"所选账号均未通过授权校验：{detail}")
+        if skipped:
+            logger.warning("CPA 导出跳过 %d 个未授权账号，示例：%s", len(skipped), skipped[0])
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        if len(accounts) == 1:
+        if len(valid_accounts) == 1:
             # 单个账号直接返回 JSON 文件
-            acc = accounts[0]
+            acc = valid_accounts[0]
             token_data = generate_token_json(acc)
             content = json.dumps(token_data, ensure_ascii=False, indent=2)
             filename = f"{acc.email}.json"
@@ -508,7 +549,7 @@ async def export_accounts_cpa(request: BatchExportRequest):
         # 多个账号打包为 ZIP
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for acc in accounts:
+            for acc in valid_accounts:
                 token_data = generate_token_json(acc)
                 content = json.dumps(token_data, ensure_ascii=False, indent=2)
                 zf.writestr(f"{acc.email}.json", content)
@@ -767,6 +808,16 @@ async def upload_account_to_cpa(account_id: int, request: Optional[CPAUploadRequ
                 "success": False,
                 "error": "账号缺少 Token，无法上传"
             }
+        expected_client_id = str(get_settings().openai_client_id or "").strip()
+        valid, reason = validate_codex_account_for_upload(
+            account,
+            expected_client_id=expected_client_id,
+        )
+        if not valid:
+            return {
+                "success": False,
+                "error": f"凭证未授权，已阻止上传：{reason}"
+            }
 
         # 生成 Token JSON
         token_data = generate_token_json(account)
@@ -873,6 +924,13 @@ async def upload_account_to_sub2api(account_id: int, request: Optional[Sub2ApiUp
             raise HTTPException(status_code=404, detail="账号不存在")
         if not account.access_token:
             return {"success": False, "error": "账号缺少 Token，无法上传"}
+        expected_client_id = str(get_settings().openai_client_id or "").strip()
+        valid, reason = validate_codex_account_for_upload(
+            account,
+            expected_client_id=expected_client_id,
+        )
+        if not valid:
+            return {"success": False, "error": f"凭证未授权，已阻止上传：{reason}"}
 
         success, message = upload_to_sub2api(
             [account], api_url, api_key,

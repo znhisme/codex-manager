@@ -485,10 +485,155 @@
                                 </div>
                             </div>
 
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="oauth-rate-limit-cooldown-seconds">OAuth 429 冷却 (秒)</label>
+                                    <input type="number" id="oauth-rate-limit-cooldown-seconds" name="oauth_rate_limit_cooldown_seconds" value="900" min="0" max="86400">
+                                </div>
+
+                                <div class="form-group">
+                                    <label for="oauth-rate-limit-backoff-base-seconds">OAuth 退避基数 (秒)</label>
+                                    <input type="number" id="oauth-rate-limit-backoff-base-seconds" name="oauth_rate_limit_backoff_base_seconds" value="6" min="1" max="600">
+                                </div>
+
+                                <div class="form-group">
+                                    <label for="oauth-rate-limit-backoff-max-seconds">OAuth 退避上限 (秒)</label>
+                                    <input type="number" id="oauth-rate-limit-backoff-max-seconds" name="oauth_rate_limit_backoff_max_seconds" value="60" min="1" max="3600">
+                                </div>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="batch-oauth-max-concurrency">批量 OAuth 最大并发</label>
+                                    <input type="number" id="batch-oauth-max-concurrency" name="batch_oauth_max_concurrency" value="1" min="0" max="50">
+                                </div>
+
+                                <div class="form-group">
+                                    <label for="batch-oauth-start-jitter-min-seconds">批量 OAuth 抖动最小值 (秒)</label>
+                                    <input type="number" id="batch-oauth-start-jitter-min-seconds" name="batch_oauth_start_jitter_min_seconds" value="0" min="0" max="120">
+                                </div>
+
+                                <div class="form-group">
+                                    <label for="batch-oauth-start-jitter-max-seconds">批量 OAuth 抖动最大值 (秒)</label>
+                                    <input type="number" id="batch-oauth-start-jitter-max-seconds" name="batch_oauth_start_jitter_max_seconds" value="5" min="0" max="300">
+                                </div>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="oauth-pending-enabled">启用待授权定时补授权</label>
+                                    <select id="oauth-pending-enabled" name="oauth_pending_enabled">
+                                        <option value="true" selected>启用</option>
+                                        <option value="false">关闭</option>
+                                    </select>
+                                </div>
+
+                                <div class="form-group">
+                                    <label for="oauth-pending-poll-interval-seconds">待授权轮询间隔 (秒)</label>
+                                    <input type="number" id="oauth-pending-poll-interval-seconds" name="oauth_pending_poll_interval_seconds" value="60" min="10" max="3600">
+                                </div>
+
+                                <div class="form-group">
+                                    <label for="oauth-pending-max-attempts">待授权最大重试次数</label>
+                                    <input type="number" id="oauth-pending-max-attempts" name="oauth_pending_max_attempts" value="8" min="1" max="100">
+                                </div>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="oauth-pending-retry-base-seconds">待授权重试基数 (秒)</label>
+                                    <input type="number" id="oauth-pending-retry-base-seconds" name="oauth_pending_retry_base_seconds" value="60" min="5" max="3600">
+                                </div>
+
+                                <div class="form-group">
+                                    <label for="oauth-pending-retry-max-seconds">待授权重试上限 (秒)</label>
+                                    <input type="number" id="oauth-pending-retry-max-seconds" name="oauth_pending_retry_max_seconds" value="1800" min="10" max="86400">
+                                </div>
+                            </div>
+
                             <div class="form-actions">
                                 <button type="submit" class="btn btn-primary">💾 保存设置</button>
                             </div>
                         </form>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-top: var(--spacing-lg);">
+                    <div class="card-header">
+                        <h3>待授权队列</h3>
+                        <span class="hint">显示待授权账号的完整状态（含运行中、失败、限流）</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="oauth-pending-status-filter">状态筛选</label>
+                                <select id="oauth-pending-status-filter">
+                                    <option value="">全部</option>
+                                    <option value="pending">待处理</option>
+                                    <option value="running">运行中</option>
+                                    <option value="rate_limited">限流中</option>
+                                    <option value="failed">失败</option>
+                                    <option value="success">成功</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="display:flex;align-items:end;gap:var(--spacing-sm);">
+                                <button class="btn btn-secondary" id="refresh-oauth-pending-btn">🔄 刷新列表</button>
+                                <button class="btn btn-primary" id="trigger-oauth-pending-btn">▶️ 立即补授权一轮</button>
+                            </div>
+                        </div>
+
+                        <div class="info-grid" style="margin-bottom: var(--spacing-md);">
+                            <div class="info-item">
+                                <span class="label">总数</span>
+                                <span id="oauth-pending-total" class="value">-</span>
+                            </div>
+                            <div class="info-item">
+                                <span class="label">待处理</span>
+                                <span id="oauth-pending-pending" class="value">-</span>
+                            </div>
+                            <div class="info-item">
+                                <span class="label">运行中</span>
+                                <span id="oauth-pending-running" class="value">-</span>
+                            </div>
+                            <div class="info-item">
+                                <span class="label">限流中</span>
+                                <span id="oauth-pending-rate-limited" class="value">-</span>
+                            </div>
+                            <div class="info-item">
+                                <span class="label">失败</span>
+                                <span id="oauth-pending-failed" class="value">-</span>
+                            </div>
+                            <div class="info-item">
+                                <span class="label">成功</span>
+                                <span id="oauth-pending-success" class="value">-</span>
+                            </div>
+                        </div>
+
+                        <div class="table-container">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>账号ID</th>
+                                        <th>邮箱</th>
+                                        <th>账号状态</th>
+                                        <th>队列状态</th>
+                                        <th>尝试次数</th>
+                                        <th>下次重试</th>
+                                        <th>最近错误</th>
+                                        <th>更新时间</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="oauth-pending-table-body">
+                                    <tr>
+                                        <td colspan="8">
+                                            <div class="empty-state">
+                                                <div class="empty-state-title">加载中...</div>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
                 </div>
             </div>

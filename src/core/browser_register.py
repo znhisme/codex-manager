@@ -278,6 +278,110 @@ class BrowserRegistrationEngine:
         """保留 prompt=login，强制重新登录（不复用已登录会话）。"""
         return auth_url
 
+    def _extract_oauth_callback_from_text(self, text: str) -> str:
+        if not text:
+            return ""
+        patterns = (
+            r"https?://localhost(?::\d+)?/auth/callback[^\s\"'<>]+",
+            r"/auth/callback\?[^\"'<>\\s]+",
+        )
+        for pattern in patterns:
+            for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                candidate = (match or "").strip().replace("&amp;", "&")
+                if not candidate:
+                    continue
+                if candidate.startswith("/auth/callback"):
+                    candidate = f"http://localhost:1455{candidate}"
+                if "code=" in candidate and "state=" in candidate:
+                    return candidate
+        return ""
+
+    def _is_password_login_page(self, page) -> bool:
+        try:
+            current_url = (page.url or "").lower()
+        except Exception:
+            current_url = ""
+
+        try:
+            pwd_locator = page.locator("input[type='password'], input[name='current-password']")
+            has_password_input = pwd_locator.count() > 0 and pwd_locator.first.is_visible()
+        except Exception:
+            has_password_input = False
+
+        if not has_password_input:
+            return False
+
+        if any(key in current_url for key in ("/log-in/password", "/u/login/password", "/log-in")):
+            return True
+
+        try:
+            login_form = page.locator(
+                "form[action*='/log-in/password'], form[action*='/u/login/password']"
+            )
+            if login_form.count() > 0:
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def _click_oauth_consent_continue(self, page) -> bool:
+        # 避免把登录页的“继续”误当成 consent 的“继续”
+        if self._is_password_login_page(page):
+            self._log("当前处于登录密码页，跳过 Consent 按钮点击，先走密码提交流程", "warning")
+            return False
+
+        selectors = [
+            "button:has-text('Continue')",
+            "button:has-text('Allow')",
+            "button:has-text('Authorize')",
+            "button:has-text('Accept')",
+            "button:has-text('继续')",
+            "button:has-text('同意')",
+            "button:has-text('允许')",
+            "button:has-text('授权')",
+            "button:has-text('确认')",
+            "div[role='button']:has-text('Continue')",
+            "div[role='button']:has-text('Allow')",
+            "div[role='button']:has-text('Authorize')",
+            "div[role='button']:has-text('继续')",
+            "div[role='button']:has-text('同意')",
+            "div[role='button']:has-text('允许')",
+            "div[role='button']:has-text('授权')",
+        ]
+        deny_keywords = ("cancel", "deny", "decline", "拒绝", "取消")
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                count = locator.count()
+                for idx in range(count):
+                    item = locator.nth(idx)
+                    if not item.is_visible():
+                        continue
+                    form_action = ""
+                    try:
+                        form_action = (item.evaluate(
+                            "(el) => { const f = el.closest('form'); return f ? (f.getAttribute('action') || '') : ''; }"
+                        ) or "").strip().lower()
+                    except Exception:
+                        form_action = ""
+                    if any(key in form_action for key in ("/log-in/password", "/u/login/password", "/log-in")):
+                        continue
+                    text = ""
+                    try:
+                        text = (item.inner_text() or "").strip()
+                    except Exception:
+                        text = ""
+                    text_lower = text.lower()
+                    if any(keyword in text_lower for keyword in deny_keywords):
+                        continue
+                    item.click(timeout=3000)
+                    self._log(f"已点击 OAuth 授权按钮: {text or selector}")
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _capture_oauth_callback(self, page, timeout_ms: int = 20000) -> str:
         """通过导航与请求监听捕获 OAuth 回调 URL。"""
         callback_holder = {"url": ""}
@@ -295,6 +399,7 @@ class BrowserRegistrationEngine:
             pass
 
         start = time.time()
+        tick = 0
         while (time.time() - start) * 1000 < timeout_ms:
             if callback_holder["url"]:
                 return callback_holder["url"]
@@ -304,6 +409,16 @@ class BrowserRegistrationEngine:
                     return current
             except Exception:
                 pass
+            # 有些场景会显示 callback 链接但不真正跳转，直接从页面内容提取
+            if tick % 3 == 0:
+                try:
+                    content = page.content()
+                    extracted = self._extract_oauth_callback_from_text(content)
+                    if extracted:
+                        return extracted
+                except Exception:
+                    pass
+            tick += 1
             time.sleep(0.2)
         return ""
 
@@ -685,6 +800,10 @@ class BrowserRegistrationEngine:
                             "proxy_used": self.proxy_url,
                             "token_mode": "browser",
                             "token_source": "playwright",
+                            "auth_profile": "session",
+                            "issued_client_id": "",
+                            "token_audience": [],
+                            "token_scope": "",
                             "registered_at": datetime.now().isoformat()
                         }
                         
@@ -692,13 +811,19 @@ class BrowserRegistrationEngine:
                         if self.skip_oauth:
                             self._log("已配置跳过 OAuth 授权流程 (BROWSER_SKIP_OAUTH=1)", "warning")
                         else:
+                            from ..config.settings import get_settings
                             from .openai.oauth import generate_oauth_url, submit_callback_url
+                            oauth_settings = get_settings()
                             oauth_success = False
                             # 暂时一直重复获取 OAuth 重新登录直到获取到 refresh token 为止
                             for attempt in range(30):
                                 try:
                                     self._log(f"启动获取正式的 OAuth Refresh Token！（尝试次数: {attempt + 1}）")
-                                    oauth_info = generate_oauth_url()
+                                    oauth_info = generate_oauth_url(
+                                        redirect_uri=oauth_settings.openai_redirect_uri,
+                                        scope=oauth_settings.openai_scope,
+                                        client_id=oauth_settings.openai_client_id,
+                                    )
                                     authorize_url = self._build_oauth_authorize_url(oauth_info.auth_url)
                                     page.goto(authorize_url)
                                     self._random_delay(1.0, 2.0)
@@ -706,15 +831,13 @@ class BrowserRegistrationEngine:
 
                                     callback_url = self._capture_oauth_callback(page, timeout_ms=20000)
                                     if not callback_url:
-                                        self._log("试图点击授权界面的 Continue/Allow 等确认许可键...")
-                                        btn_locator = page.locator("button:has-text('Allow'), button:has-text('Authorize'), button:has-text('Continue'), div[role='button']")
-                                        if btn_locator.count() > 0:
-                                            for i in range(btn_locator.count()):
-                                                if btn_locator.nth(i).is_visible():
-                                                    btn_locator.nth(i).click()
-                                                    break
-                                        else:
-                                            self._handle_oauth_relogin(page)
+                                        # 先补一次登录处理，避免停在密码页时误点 Continue
+                                        self._handle_oauth_relogin(page)
+                                        callback_url = self._capture_oauth_callback(page, timeout_ms=8000)
+
+                                    if not callback_url:
+                                        self._log("试图点击授权界面的 Continue/Allow/继续 等确认许可键...")
+                                        self._click_oauth_consent_continue(page)
 
                                         callback_url = self._capture_oauth_callback(page, timeout_ms=15000)
 
@@ -741,6 +864,9 @@ class BrowserRegistrationEngine:
                                         callback_url=final_oauth_url,
                                         expected_state=oauth_info.state,
                                         code_verifier=oauth_info.code_verifier,
+                                        redirect_uri=oauth_settings.openai_redirect_uri,
+                                        client_id=oauth_settings.openai_client_id,
+                                        token_url=oauth_settings.openai_token_url,
                                         proxy_url=self.proxy_url
                                     )
                                     import json as token_json
@@ -750,6 +876,19 @@ class BrowserRegistrationEngine:
                                         result.refresh_token = oauth_tokens["refresh_token"]
                                         result.id_token = oauth_tokens.get("id_token", "")
                                         result.metadata["token_source"] = "browser_oauth"
+                                        result.metadata["auth_profile"] = "codex_oauth"
+                                        result.metadata["issued_client_id"] = str(
+                                            oauth_tokens.get("issued_client_id")
+                                            or oauth_settings.openai_client_id
+                                            or ""
+                                        ).strip()
+                                        token_audience = oauth_tokens.get("token_audience") or []
+                                        if not isinstance(token_audience, list):
+                                            token_audience = [str(token_audience)]
+                                        result.metadata["token_audience"] = token_audience
+                                        result.metadata["token_scope"] = str(
+                                            oauth_tokens.get("token_scope") or ""
+                                        ).strip()
                                         self._log("🎉 正式授权 Token (附带无限续期 Refresh Token) 提取成功！")
                                         oauth_success = True
                                         break
@@ -798,12 +937,20 @@ class BrowserRegistrationEngine:
             from ..database import crud
             from ..database.session import get_db
             settings = get_settings()
+            metadata = result.metadata or {}
+            token_source = str(metadata.get("token_source") or "").strip().lower()
+            issued_client_id = str(metadata.get("issued_client_id") or "").strip()
+            client_id_for_db = issued_client_id or (
+                settings.openai_client_id
+                if token_source in {"oauth", "browser_oauth"} and result.refresh_token
+                else None
+            )
             with get_db() as db:
                 account = crud.create_account(
                     db,
                     email=result.email,
                     password=result.password,
-                    client_id=settings.openai_client_id,
+                    client_id=client_id_for_db,
                     session_token=result.session_token,
                     email_service=self.email_service.service_type.value,
                     email_service_id=self.email_info.get("service_id") if self.email_info else None,

@@ -58,6 +58,12 @@ class Account(Base):
     cookies = Column(Text)  # 完整 cookie 字符串，用于支付请求
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    oauth_pending_record = relationship(
+        'OAuthPendingAccount',
+        back_populates='account',
+        uselist=False,
+        cascade='all, delete-orphan',
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -82,6 +88,23 @@ class Account(Base):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
+
+
+class OAuthPendingAccount(Base):
+    """待 OAuth 授权账号队列表"""
+    __tablename__ = 'oauth_pending_accounts'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey('accounts.id'), nullable=False, unique=True, index=True)
+    status = Column(String(20), default='pending', index=True)  # pending/running/success/failed/rate_limited
+    attempt_count = Column(Integer, default=0)
+    next_retry_at = Column(DateTime, default=datetime.utcnow, index=True)
+    last_error = Column(Text)
+    locked_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    account = relationship('Account', back_populates='oauth_pending_record')
 
 
 class EmailService(Base):

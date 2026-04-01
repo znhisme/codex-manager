@@ -8,8 +8,10 @@ from typing import List, Tuple
 
 from curl_cffi import requests as cffi_requests
 
+from ...config.settings import get_settings
 from ...database.models import Account
 from ...database.session import get_db
+from .cpa_upload import validate_codex_account_for_upload
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,13 @@ def upload_to_team_manager(
         return False, "Team Manager API Key 未配置"
     if not account.access_token:
         return False, "账号缺少 access_token"
+    expected_client_id = str(get_settings().openai_client_id or "").strip()
+    valid, reason = validate_codex_account_for_upload(
+        account,
+        expected_client_id=expected_client_id,
+    )
+    if not valid:
+        return False, f"凭证未授权：{reason}"
 
     url = api_url.rstrip("/") + "/admin/teams/import"
     headers = {
@@ -89,6 +98,7 @@ def batch_upload_to_team_manager(
     }
 
     with get_db() as db:
+        expected_client_id = str(get_settings().openai_client_id or "").strip()
         lines = []
         valid_accounts = []
         for account_id in account_ids:
@@ -103,6 +113,16 @@ def batch_upload_to_team_manager(
                 results["skipped_count"] += 1
                 results["details"].append(
                     {"id": account_id, "email": account.email, "success": False, "error": "缺少 Token"}
+                )
+                continue
+            valid, reason = validate_codex_account_for_upload(
+                account,
+                expected_client_id=expected_client_id,
+            )
+            if not valid:
+                results["skipped_count"] += 1
+                results["details"].append(
+                    {"id": account_id, "email": account.email, "success": False, "error": f"凭证未授权：{reason}"}
                 )
                 continue
             # 格式：邮箱,AT,RT,ST,ClientID

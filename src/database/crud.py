@@ -7,7 +7,16 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, desc, asc, func
 
-from .models import Account, EmailService, RegistrationTask, Setting, Proxy, CpaService, Sub2ApiService
+from .models import (
+    Account,
+    EmailService,
+    RegistrationTask,
+    Setting,
+    Proxy,
+    CpaService,
+    Sub2ApiService,
+    OAuthPendingAccount,
+)
 
 
 # ============================================================================
@@ -150,6 +159,92 @@ def get_accounts_count(
         query = query.filter(Account.status == status)
 
     return query.scalar()
+
+
+def get_oauth_pending_by_account_id(db: Session, account_id: int) -> Optional[OAuthPendingAccount]:
+    """根据账号 ID 获取待授权队列记录"""
+    return db.query(OAuthPendingAccount).filter(OAuthPendingAccount.account_id == account_id).first()
+
+
+def get_oauth_pending_by_id(db: Session, pending_id: int) -> Optional[OAuthPendingAccount]:
+    """根据队列 ID 获取待授权记录"""
+    return db.query(OAuthPendingAccount).filter(OAuthPendingAccount.id == pending_id).first()
+
+
+def create_oauth_pending_account(
+    db: Session,
+    account_id: int,
+    status: str = "pending",
+    attempt_count: int = 0,
+    next_retry_at: Optional[datetime] = None,
+    last_error: Optional[str] = None,
+) -> OAuthPendingAccount:
+    """创建待 OAuth 授权队列记录"""
+    record = OAuthPendingAccount(
+        account_id=account_id,
+        status=status or "pending",
+        attempt_count=max(0, int(attempt_count or 0)),
+        next_retry_at=next_retry_at or datetime.utcnow(),
+        last_error=last_error,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def update_oauth_pending_account(
+    db: Session,
+    pending_id: int,
+    **kwargs,
+) -> Optional[OAuthPendingAccount]:
+    """更新待 OAuth 授权队列记录"""
+    record = get_oauth_pending_by_id(db, pending_id)
+    if not record:
+        return None
+    for key, value in kwargs.items():
+        if hasattr(record, key) and value is not None:
+            setattr(record, key, value)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def get_due_oauth_pending_accounts(
+    db: Session,
+    due_before: Optional[datetime] = None,
+    statuses: Optional[List[str]] = None,
+    limit: int = 20,
+) -> List[OAuthPendingAccount]:
+    """获取到期可执行的待 OAuth 授权记录"""
+    if due_before is None:
+        due_before = datetime.utcnow()
+    if statuses is None:
+        statuses = ["pending", "rate_limited"]
+
+    query = db.query(OAuthPendingAccount).filter(
+        OAuthPendingAccount.status.in_(statuses),
+        or_(
+            OAuthPendingAccount.next_retry_at.is_(None),
+            OAuthPendingAccount.next_retry_at <= due_before,
+        ),
+    ).order_by(
+        asc(OAuthPendingAccount.next_retry_at),
+        asc(OAuthPendingAccount.id),
+    )
+
+    return query.limit(max(1, int(limit or 1))).all()
+
+
+def get_oauth_pending_count(
+    db: Session,
+    status: Optional[str] = None,
+) -> int:
+    """统计待 OAuth 授权记录数量"""
+    query = db.query(func.count(OAuthPendingAccount.id))
+    if status:
+        query = query.filter(OAuthPendingAccount.status == status)
+    return int(query.scalar() or 0)
 
 
 # ============================================================================

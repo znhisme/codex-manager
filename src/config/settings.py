@@ -281,6 +281,72 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
         category=SettingCategory.REGISTRATION,
         description="全局并发线程数（控制剔除、注册等）"
     ),
+    "oauth_rate_limit_cooldown_seconds": SettingDefinition(
+        db_key="registration.oauth_rate_limit_cooldown_seconds",
+        default_value=900,
+        category=SettingCategory.REGISTRATION,
+        description="OAuth 遇到 429 后的全局冷却时间（秒）"
+    ),
+    "oauth_rate_limit_backoff_base_seconds": SettingDefinition(
+        db_key="registration.oauth_rate_limit_backoff_base_seconds",
+        default_value=6,
+        category=SettingCategory.REGISTRATION,
+        description="OAuth 重试退避基础时间（秒）"
+    ),
+    "oauth_rate_limit_backoff_max_seconds": SettingDefinition(
+        db_key="registration.oauth_rate_limit_backoff_max_seconds",
+        default_value=60,
+        category=SettingCategory.REGISTRATION,
+        description="OAuth 重试退避最大时间（秒）"
+    ),
+    "batch_oauth_max_concurrency": SettingDefinition(
+        db_key="registration.batch_oauth_max_concurrency",
+        default_value=1,
+        category=SettingCategory.REGISTRATION,
+        description="批量任务 OAuth 模式最大并发（0 表示不限制）"
+    ),
+    "batch_oauth_start_jitter_min_seconds": SettingDefinition(
+        db_key="registration.batch_oauth_start_jitter_min_seconds",
+        default_value=0,
+        category=SettingCategory.REGISTRATION,
+        description="批量 OAuth 任务启动抖动最小秒数"
+    ),
+    "batch_oauth_start_jitter_max_seconds": SettingDefinition(
+        db_key="registration.batch_oauth_start_jitter_max_seconds",
+        default_value=5,
+        category=SettingCategory.REGISTRATION,
+        description="批量 OAuth 任务启动抖动最大秒数"
+    ),
+    "oauth_pending_enabled": SettingDefinition(
+        db_key="registration.oauth_pending_enabled",
+        default_value=True,
+        category=SettingCategory.REGISTRATION,
+        description="是否启用待授权账号定时 OAuth 补授权"
+    ),
+    "oauth_pending_poll_interval_seconds": SettingDefinition(
+        db_key="registration.oauth_pending_poll_interval_seconds",
+        default_value=60,
+        category=SettingCategory.REGISTRATION,
+        description="待授权账号轮询间隔（秒）"
+    ),
+    "oauth_pending_max_attempts": SettingDefinition(
+        db_key="registration.oauth_pending_max_attempts",
+        default_value=8,
+        category=SettingCategory.REGISTRATION,
+        description="待授权账号最大重试次数"
+    ),
+    "oauth_pending_retry_base_seconds": SettingDefinition(
+        db_key="registration.oauth_pending_retry_base_seconds",
+        default_value=60,
+        category=SettingCategory.REGISTRATION,
+        description="待授权账号重试基础间隔（秒）"
+    ),
+    "oauth_pending_retry_max_seconds": SettingDefinition(
+        db_key="registration.oauth_pending_retry_max_seconds",
+        default_value=1800,
+        category=SettingCategory.REGISTRATION,
+        description="待授权账号重试最大间隔（秒）"
+    ),
 
     # 邮箱服务配置
     "email_service_priority": SettingDefinition(
@@ -587,6 +653,17 @@ SETTING_TYPES: Dict[str, Type] = {
     "registration_sleep_min": int,
     "registration_sleep_max": int,
     "global_concurrency": int,
+    "oauth_rate_limit_cooldown_seconds": int,
+    "oauth_rate_limit_backoff_base_seconds": int,
+    "oauth_rate_limit_backoff_max_seconds": int,
+    "batch_oauth_max_concurrency": int,
+    "batch_oauth_start_jitter_min_seconds": int,
+    "batch_oauth_start_jitter_max_seconds": int,
+    "oauth_pending_enabled": bool,
+    "oauth_pending_poll_interval_seconds": int,
+    "oauth_pending_max_attempts": int,
+    "oauth_pending_retry_base_seconds": int,
+    "oauth_pending_retry_max_seconds": int,
     "email_service_priority": dict,
     "tempmail_timeout": int,
     "tempmail_max_retries": int,
@@ -891,6 +968,17 @@ class Settings(BaseModel):
     registration_sleep_min: int = 5
     registration_sleep_max: int = 30
     global_concurrency: int = 1
+    oauth_rate_limit_cooldown_seconds: int = 900
+    oauth_rate_limit_backoff_base_seconds: int = 6
+    oauth_rate_limit_backoff_max_seconds: int = 60
+    batch_oauth_max_concurrency: int = 1
+    batch_oauth_start_jitter_min_seconds: int = 0
+    batch_oauth_start_jitter_max_seconds: int = 5
+    oauth_pending_enabled: bool = True
+    oauth_pending_poll_interval_seconds: int = 60
+    oauth_pending_max_attempts: int = 8
+    oauth_pending_retry_base_seconds: int = 60
+    oauth_pending_retry_max_seconds: int = 1800
 
     # 邮箱服务配置
     email_service_priority: Dict[str, int] = {"tempmail": 0, "outlook": 1, "custom_domain": 2}

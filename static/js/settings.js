@@ -82,7 +82,17 @@ const elements = {
     updatePublished: document.getElementById('update-published'),
     updateMessage: document.getElementById('update-message'),
     updateReleaseUrl: document.getElementById('update-release-url'),
-    updateNotes: document.getElementById('update-notes')
+    updateNotes: document.getElementById('update-notes'),
+    oauthPendingStatusFilter: document.getElementById('oauth-pending-status-filter'),
+    refreshOauthPendingBtn: document.getElementById('refresh-oauth-pending-btn'),
+    triggerOauthPendingBtn: document.getElementById('trigger-oauth-pending-btn'),
+    oauthPendingTotal: document.getElementById('oauth-pending-total'),
+    oauthPendingPending: document.getElementById('oauth-pending-pending'),
+    oauthPendingRunning: document.getElementById('oauth-pending-running'),
+    oauthPendingRateLimited: document.getElementById('oauth-pending-rate-limited'),
+    oauthPendingFailed: document.getElementById('oauth-pending-failed'),
+    oauthPendingSuccess: document.getElementById('oauth-pending-success'),
+    oauthPendingTableBody: document.getElementById('oauth-pending-table-body')
 };
 
 // 选中的服务 ID
@@ -94,6 +104,8 @@ document.addEventListener('DOMContentLoaded', () => {
     loadSettings();
     loadEmailServices();
     loadDatabaseInfo();
+    loadOauthPendingStatus();
+    loadOauthPendingAccounts();
     loadProxies();
     loadCpaServices();
     loadSub2ApiServices();
@@ -332,6 +344,23 @@ function initEventListeners() {
     if (elements.confirmUpdateBtn) {
         elements.confirmUpdateBtn.addEventListener('click', handleConfirmUpdate);
     }
+
+    if (elements.refreshOauthPendingBtn) {
+        elements.refreshOauthPendingBtn.addEventListener('click', () => {
+            loadOauthPendingStatus();
+            loadOauthPendingAccounts();
+        });
+    }
+
+    if (elements.triggerOauthPendingBtn) {
+        elements.triggerOauthPendingBtn.addEventListener('click', handleTriggerOauthPending);
+    }
+
+    if (elements.oauthPendingStatusFilter) {
+        elements.oauthPendingStatusFilter.addEventListener('change', () => {
+            loadOauthPendingAccounts();
+        });
+    }
 }
 
 // 加载设置
@@ -352,6 +381,28 @@ async function loadSettings() {
         document.getElementById('sleep-min').value = data.registration?.sleep_min || 5;
         document.getElementById('sleep-max').value = data.registration?.sleep_max || 30;
         document.getElementById('global-concurrency').value = data.registration?.global_concurrency || 1;
+        document.getElementById('oauth-rate-limit-cooldown-seconds').value =
+            data.registration?.oauth_rate_limit_cooldown_seconds || 900;
+        document.getElementById('oauth-rate-limit-backoff-base-seconds').value =
+            data.registration?.oauth_rate_limit_backoff_base_seconds || 6;
+        document.getElementById('oauth-rate-limit-backoff-max-seconds').value =
+            data.registration?.oauth_rate_limit_backoff_max_seconds || 60;
+        document.getElementById('batch-oauth-max-concurrency').value =
+            data.registration?.batch_oauth_max_concurrency ?? 1;
+        document.getElementById('batch-oauth-start-jitter-min-seconds').value =
+            data.registration?.batch_oauth_start_jitter_min_seconds ?? 0;
+        document.getElementById('batch-oauth-start-jitter-max-seconds').value =
+            data.registration?.batch_oauth_start_jitter_max_seconds ?? 5;
+        document.getElementById('oauth-pending-enabled').value =
+            data.registration?.oauth_pending_enabled === false ? 'false' : 'true';
+        document.getElementById('oauth-pending-poll-interval-seconds').value =
+            data.registration?.oauth_pending_poll_interval_seconds || 60;
+        document.getElementById('oauth-pending-max-attempts').value =
+            data.registration?.oauth_pending_max_attempts || 8;
+        document.getElementById('oauth-pending-retry-base-seconds').value =
+            data.registration?.oauth_pending_retry_base_seconds || 60;
+        document.getElementById('oauth-pending-retry-max-seconds').value =
+            data.registration?.oauth_pending_retry_max_seconds || 1800;
 
         // 验证码等待配置
         if (data.email_code) {
@@ -484,6 +535,134 @@ async function loadDatabaseInfo() {
     }
 }
 
+function getOauthPendingStatusBadge(status) {
+    const statusMap = {
+        pending: { text: '待处理', className: 'pending' },
+        running: { text: '运行中', className: 'running' },
+        rate_limited: { text: '限流中', className: 'warning' },
+        failed: { text: '失败', className: 'failed' },
+        success: { text: '成功', className: 'completed' }
+    };
+    const item = statusMap[status] || { text: status || '-', className: 'disabled' };
+    return `<span class="status-badge ${item.className}">${item.text}</span>`;
+}
+
+function getAccountStatusBadge(status) {
+    const text = getStatusText('account', status) || status || '-';
+    const className = getStatusClass('account', status) || 'disabled';
+    return `<span class="status-badge ${className}">${text}</span>`;
+}
+
+async function loadOauthPendingStatus() {
+    if (!elements.oauthPendingTotal) return;
+    try {
+        const resp = await api.get('/scheduler/oauth-pending/status');
+        const data = resp?.data || {};
+        elements.oauthPendingTotal.textContent = format.number(data.total || 0);
+        elements.oauthPendingPending.textContent = format.number(data.pending || 0);
+        elements.oauthPendingRunning.textContent = format.number(data.running || 0);
+        elements.oauthPendingRateLimited.textContent = format.number(data.rate_limited || 0);
+        elements.oauthPendingFailed.textContent = format.number(data.failed || 0);
+        elements.oauthPendingSuccess.textContent = format.number(data.success || 0);
+    } catch (error) {
+        console.error('加载待授权状态失败:', error);
+    }
+}
+
+async function loadOauthPendingAccounts() {
+    if (!elements.oauthPendingTableBody) return;
+
+    const status = elements.oauthPendingStatusFilter?.value || '';
+    const params = new URLSearchParams({
+        page: 1,
+        page_size: 100
+    });
+    if (status) {
+        params.append('status', status);
+    }
+
+    elements.oauthPendingTableBody.innerHTML = `
+        <tr>
+            <td colspan="8">
+                <div class="empty-state">
+                    <div class="empty-state-title">加载中...</div>
+                </div>
+            </td>
+        </tr>
+    `;
+
+    try {
+        const resp = await api.get(`/scheduler/oauth-pending/accounts?${params}`);
+        const data = resp?.data || {};
+        const items = Array.isArray(data.items) ? data.items : [];
+
+        if (items.length === 0) {
+            elements.oauthPendingTableBody.innerHTML = `
+                <tr>
+                    <td colspan="8">
+                        <div class="empty-state">
+                            <div class="empty-state-icon">📭</div>
+                            <div class="empty-state-title">暂无待授权记录</div>
+                            <div class="empty-state-description">当前筛选条件下没有数据</div>
+                        </div>
+                    </td>
+                </tr>
+            `;
+            return;
+        }
+
+        elements.oauthPendingTableBody.innerHTML = items.map(item => `
+            <tr>
+                <td>${item.account_id || '-'}</td>
+                <td title="${escapeHtml(item.email || '-')}">${escapeHtml(item.email || '-')}</td>
+                <td>${getAccountStatusBadge(item.account_status)}</td>
+                <td>${getOauthPendingStatusBadge(item.pending_status)}</td>
+                <td>${format.number(item.attempt_count || 0)}</td>
+                <td>${format.date(item.next_retry_at)}</td>
+                <td title="${escapeHtml(item.last_error || '-')}">${escapeHtml(item.last_error || '-')}</td>
+                <td>${format.date(item.updated_at)}</td>
+            </tr>
+        `).join('');
+    } catch (error) {
+        console.error('加载待授权列表失败:', error);
+        elements.oauthPendingTableBody.innerHTML = `
+            <tr>
+                <td colspan="8">
+                    <div class="empty-state">
+                        <div class="empty-state-icon">❌</div>
+                        <div class="empty-state-title">加载失败</div>
+                        <div class="empty-state-description">${escapeHtml(error.message || '请稍后重试')}</div>
+                    </div>
+                </td>
+            </tr>
+        `;
+    }
+}
+
+async function handleTriggerOauthPending() {
+    if (!elements.triggerOauthPendingBtn) return;
+
+    const btn = elements.triggerOauthPendingBtn;
+    btn.disabled = true;
+    const originalText = btn.textContent;
+    btn.textContent = '执行中...';
+
+    try {
+        const resp = await api.post('/scheduler/oauth-pending/trigger', {});
+        const summary = resp?.summary || {};
+        toast.success(
+            `补授权完成：成功 ${summary.success || 0}，失败 ${summary.failed || 0}，重排 ${summary.requeued || 0}，限流 ${summary.rate_limited || 0}`
+        );
+        await loadOauthPendingStatus();
+        await loadOauthPendingAccounts();
+    } catch (error) {
+        toast.error('触发补授权失败: ' + error.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+    }
+}
+
 // 加载更新状态
 async function loadUpdateStatus() {
     if (!elements.updateCurrent) return;
@@ -592,6 +771,17 @@ async function handleSaveRegistration(e) {
         sleep_min: parseInt(document.getElementById('sleep-min').value),
         sleep_max: parseInt(document.getElementById('sleep-max').value),
         global_concurrency: parseInt(document.getElementById('global-concurrency').value),
+        oauth_rate_limit_cooldown_seconds: parseInt(document.getElementById('oauth-rate-limit-cooldown-seconds').value),
+        oauth_rate_limit_backoff_base_seconds: parseInt(document.getElementById('oauth-rate-limit-backoff-base-seconds').value),
+        oauth_rate_limit_backoff_max_seconds: parseInt(document.getElementById('oauth-rate-limit-backoff-max-seconds').value),
+        batch_oauth_max_concurrency: parseInt(document.getElementById('batch-oauth-max-concurrency').value),
+        batch_oauth_start_jitter_min_seconds: parseInt(document.getElementById('batch-oauth-start-jitter-min-seconds').value),
+        batch_oauth_start_jitter_max_seconds: parseInt(document.getElementById('batch-oauth-start-jitter-max-seconds').value),
+        oauth_pending_enabled: document.getElementById('oauth-pending-enabled').value === 'true',
+        oauth_pending_poll_interval_seconds: parseInt(document.getElementById('oauth-pending-poll-interval-seconds').value),
+        oauth_pending_max_attempts: parseInt(document.getElementById('oauth-pending-max-attempts').value),
+        oauth_pending_retry_base_seconds: parseInt(document.getElementById('oauth-pending-retry-base-seconds').value),
+        oauth_pending_retry_max_seconds: parseInt(document.getElementById('oauth-pending-retry-max-seconds').value),
     };
 
     try {

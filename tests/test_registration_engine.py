@@ -1,20 +1,24 @@
 import base64
 import json
+import time
+from types import SimpleNamespace
 
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine
+import src.core.register as register_module
+from src.core.register import RegistrationEngine, SignupFormResult
 from src.services.base import BaseEmailService
 
 
 class DummyResponse:
-    def __init__(self, status_code=200, payload=None, text="", headers=None, on_return=None):
+    def __init__(self, status_code=200, payload=None, text="", headers=None, on_return=None, url=""):
         self.status_code = status_code
         self._payload = payload
         self.text = text
         self.headers = headers or {}
         self.on_return = on_return
+        self.url = url
 
     def json(self):
         if self._payload is None:
@@ -53,6 +57,8 @@ class QueueSession:
         assert url == expected_url
         if callable(response):
             response = response(self)
+        if not getattr(response, "url", ""):
+            response.url = url
         if response.on_return:
             response.on_return(self)
         return response
@@ -294,3 +300,280 @@ def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
     assert len(email_service.otp_requests) == 1
     assert email_service.otp_requests[0]["otp_sent_at"] is not None
     assert result.metadata["token_acquired_via_relogin"] is False
+
+
+def test_handle_about_you_treats_409_as_continue(monkeypatch):
+    email_service = FakeEmailService(["123456"])
+    engine = RegistrationEngine(email_service)
+
+    callback_counter = {"count": 0}
+
+    engine.create_account = lambda name, birthdate, so_token=None: (409, {"error": "already_exists"})
+    engine.callback = lambda: callback_counter.__setitem__("count", callback_counter["count"] + 1)
+
+    assert engine._handle_about_you("登录密码阶段") is True
+    assert callback_counter["count"] == 1
+
+
+def test_oauth_login_flow_about_you_can_continue_without_waiting_otp(monkeypatch):
+    email_service = FakeEmailService(["123456"])
+    engine = RegistrationEngine(email_service)
+    engine.email = "tester@example.com"
+    engine.password = "pass-1234"
+
+    class DummyOAuthManager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start_oauth(self):
+            return OAuthStart(
+                auth_url="https://auth.example.test/flow/1",
+                state="state-1",
+                code_verifier="verifier-1",
+                redirect_uri="http://localhost:1455/auth/callback",
+            )
+
+    class DummyHttpClient:
+        def __init__(self, proxy_url=None):
+            self.session = SimpleNamespace(cookies={"__Secure-next-auth.session-token": "session-from-login"})
+
+        def check_sentinel(self, did):
+            return "sentinel-token"
+
+    monkeypatch.setattr("src.core.register.OAuthManager", DummyOAuthManager)
+    monkeypatch.setattr("src.core.register.OpenAIHTTPClient", DummyHttpClient)
+
+    monkeypatch.setattr(engine, "_oauth_get_device_id", lambda session, auth_url: "did-1")
+    monkeypatch.setattr(
+        engine,
+        "_oauth_submit_login_start",
+        lambda session, did, sen: SignupFormResult(
+            success=True,
+            page_type=OPENAI_PAGE_TYPES["LOGIN_PASSWORD"],
+            is_existing_account=False,
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_oauth_submit_login_password",
+        lambda session: SignupFormResult(
+            success=True,
+            page_type="about_you",
+            is_existing_account=False,
+        ),
+    )
+    monkeypatch.setattr(engine, "_handle_about_you", lambda source: True)
+    monkeypatch.setattr(engine, "_oauth_exchange_auth_code", lambda session, oauth_start: "auth-code-1")
+    monkeypatch.setattr(
+        engine,
+        "_oauth_handle_callback",
+        lambda oauth_manager, oauth_start, callback_url: {
+            "access_token": "access-1",
+            "refresh_token": "refresh-1",
+            "id_token": "id-1",
+        },
+    )
+
+    def fail_if_wait_otp(timeout=120):
+        raise AssertionError("about-you 分支不应触发邮箱验证码等待")
+
+    monkeypatch.setattr(engine, "wait_for_verification_email", fail_if_wait_otp)
+
+    token_info = engine._get_oauth_tokens_via_login_flow()
+
+    assert token_info is not None
+    assert token_info["access_token"] == "access-1"
+    assert engine._oauth_session_token == "session-from-login"
+
+
+def test_oauth_rate_limit_sets_global_cooldown_and_short_backoff(monkeypatch):
+    email_service = FakeEmailService(["123456"])
+    engine = RegistrationEngine(email_service)
+    engine.oauth_rate_limit_cooldown_seconds = 300
+    engine.oauth_rate_limit_backoff_base_seconds = 7
+    engine.oauth_rate_limit_backoff_max_seconds = 60
+
+    register_module._OAUTH_RATE_LIMIT_UNTIL_TS = 0.0
+    sleep_calls = []
+    monkeypatch.setattr("src.core.register.time.sleep", lambda seconds: sleep_calls.append(seconds))
+
+    engine._oauth_handle_rate_limit(2, stage="单元测试")
+
+    assert sleep_calls == [14]
+    assert register_module._OAUTH_RATE_LIMIT_UNTIL_TS > time.time() + 250
+
+
+def test_oauth_login_flow_rate_limited_stops_immediately(monkeypatch):
+    email_service = FakeEmailService(["123456"])
+    engine = RegistrationEngine(email_service)
+    engine.email = "tester@example.com"
+    engine.password = "pass-1234"
+    engine.oauth_rate_limit_cooldown_seconds = 300
+    engine.oauth_rate_limit_backoff_base_seconds = 5
+    engine.oauth_rate_limit_backoff_max_seconds = 60
+
+    class DummyOAuthManager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start_oauth(self):
+            return OAuthStart(
+                auth_url="https://auth.example.test/flow/1",
+                state="state-1",
+                code_verifier="verifier-1",
+                redirect_uri="http://localhost:1455/auth/callback",
+            )
+
+    class DummyHttpClient:
+        def __init__(self, proxy_url=None):
+            self.session = SimpleNamespace(cookies={})
+
+        def check_sentinel(self, did):
+            return "sentinel-token"
+
+    register_module._OAUTH_RATE_LIMIT_UNTIL_TS = 0.0
+    sleep_calls = []
+    monkeypatch.setattr("src.core.register.time.sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr("src.core.register.OAuthManager", DummyOAuthManager)
+    monkeypatch.setattr("src.core.register.OpenAIHTTPClient", DummyHttpClient)
+    monkeypatch.setattr(engine, "_oauth_get_device_id", lambda session, auth_url: "did-1")
+    monkeypatch.setattr(
+        engine,
+        "_oauth_submit_login_start",
+        lambda session, did, sen: SignupFormResult(
+            success=False,
+            error_message="HTTP 429: rate limit exceeded",
+        ),
+    )
+
+    token_info = engine._get_oauth_tokens_via_login_flow()
+
+    assert token_info is None
+    assert sleep_calls == [5]
+
+
+def test_oauth_submit_consent_form_supports_button_without_type_and_html_navigation():
+    session = QueueSession([
+        (
+            "POST",
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            DummyResponse(
+                status_code=200,
+                text='<html><script>window.location="/oauth/authorize/resume?flow=1"</script></html>',
+                url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            ),
+        ),
+        (
+            "GET",
+            "https://auth.openai.com/oauth/authorize/resume?flow=1",
+            DummyResponse(
+                status_code=302,
+                headers={"Location": "http://localhost:1455/auth/callback?code=code-consent-1&state=state-1"},
+            ),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+    html_text = """
+    <html>
+      <form action="/sign-in-with-chatgpt/codex/consent" method="post">
+        <input type="hidden" name="csrf_token" value="csrf-1" />
+        <button name="decision" value="allow">Continue</button>
+      </form>
+    </html>
+    """
+
+    code = engine._oauth_submit_consent_form(
+        session=session,
+        page_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        html_text=html_text,
+        redirect_uri="http://localhost:1455/auth/callback",
+    )
+
+    assert code == "code-consent-1"
+    post_data = session.calls[0]["kwargs"]["data"]
+    assert post_data["csrf_token"] == "csrf-1"
+    assert post_data["decision"] == "allow"
+
+
+def test_oauth_submit_consent_form_falls_back_to_authorize_continue_api():
+    session = QueueSession([
+        (
+            "POST",
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            DummyResponse(
+                status_code=200,
+                text="<html>consent</html>",
+                url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            ),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["signup"],
+            DummyResponse(
+                status_code=200,
+                payload={"continue_url": "https://auth.example.test/continue-api"},
+                text='{"continue_url":"https://auth.example.test/continue-api"}',
+                url=OPENAI_API_ENDPOINTS["signup"],
+            ),
+        ),
+        (
+            "GET",
+            "https://auth.example.test/continue-api",
+            DummyResponse(
+                status_code=302,
+                headers={"Location": "http://localhost:1455/auth/callback?code=code-consent-2&state=state-1"},
+            ),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+    html_text = """
+    <html>
+      <form action="/sign-in-with-chatgpt/codex/consent" method="post">
+        <input type="hidden" name="csrf_token" value="csrf-2" />
+        <button name="decision" value="allow">Continue</button>
+      </form>
+    </html>
+    """
+
+    code = engine._oauth_submit_consent_form(
+        session=session,
+        page_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        html_text=html_text,
+        redirect_uri="http://localhost:1455/auth/callback",
+    )
+
+    assert code == "code-consent-2"
+    api_data = json.loads(session.calls[1]["kwargs"]["data"])
+    assert api_data["action"] == "default"
+
+
+def test_oauth_exchange_auth_code_visits_oauth_authorize_entry_first():
+    session = QueueSession([
+        (
+            "GET",
+            "https://auth.example.test/flow/1",
+            DummyResponse(
+                status_code=302,
+                headers={"Location": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent?flow=abc"},
+            ),
+        ),
+        (
+            "GET",
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent?flow=abc",
+            DummyResponse(
+                status_code=302,
+                headers={"Location": "http://localhost:1455/auth/callback?code=code-entry-1&state=state-1"},
+            ),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+    oauth_start = OAuthStart(
+        auth_url="https://auth.example.test/flow/1",
+        state="state-1",
+        code_verifier="verifier-1",
+        redirect_uri="http://localhost:1455/auth/callback",
+    )
+
+    code = engine._oauth_exchange_auth_code(session, oauth_start)
+
+    assert code == "code-entry-1"

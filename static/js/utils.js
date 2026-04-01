@@ -337,6 +337,7 @@ const format = {
 const statusMap = {
     account: {
         active: { text: '活跃', class: 'active' },
+        pending_oauth: { text: '待授权', class: 'pending' },
         expired: { text: '过期', class: 'expired' },
         banned: { text: '封禁', class: 'banned' },
         failed: { text: '失败', class: 'failed' }
@@ -373,6 +374,7 @@ function getServiceTypeText(type) {
 
 const accountStatusIconMap = {
     active:  { icon: '🟢', title: '活跃' },
+    pending_oauth: { icon: '🕒', title: '待授权' },
     expired: { icon: '🟡', title: '过期' },
     banned:  { icon: '🔴', title: '封禁' },
     failed:  { icon: '❌', title: '失败' },

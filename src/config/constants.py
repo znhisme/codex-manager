@@ -18,6 +18,7 @@ class AccountStatus(str, Enum):
     EXPIRED = "expired"
     BANNED = "banned"
     FAILED = "failed"
+    PENDING_OAUTH = "pending_oauth"
 
 
 class TaskStatus(str, Enum):

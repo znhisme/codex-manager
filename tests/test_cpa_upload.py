@@ -1,4 +1,5 @@
 from src.core.upload import cpa_upload
+from types import SimpleNamespace
 
 
 class FakeResponse:
@@ -108,3 +109,60 @@ def test_test_cpa_connection_uses_get_and_normalized_url(monkeypatch):
     assert message == "CPA 连接测试成功"
     assert calls[0]["url"] == "https://cpa.example.com/v0/management/auth-files"
     assert calls[0]["kwargs"]["headers"]["Authorization"] == "Bearer token-123"
+
+
+def test_validate_codex_account_for_upload_accepts_oauth_profile_without_jwt_claims():
+    account = SimpleNamespace(
+        email="tester@example.com",
+        access_token="opaque-access-token",
+        refresh_token="refresh-token",
+        client_id="app_expected",
+        id_token="",
+        extra_data={"token_source": "oauth"},
+    )
+
+    valid, reason = cpa_upload.validate_codex_account_for_upload(
+        account,
+        expected_client_id="app_expected",
+    )
+
+    assert valid is True
+    assert reason == ""
+
+
+def test_validate_codex_account_for_upload_rejects_non_oauth_source():
+    account = SimpleNamespace(
+        email="tester@example.com",
+        access_token="opaque-access-token",
+        refresh_token="refresh-token",
+        client_id="app_expected",
+        id_token="",
+        extra_data={"token_source": "session"},
+    )
+
+    valid, reason = cpa_upload.validate_codex_account_for_upload(
+        account,
+        expected_client_id="app_expected",
+    )
+
+    assert valid is False
+    assert "token_source" in reason
+
+
+def test_validate_codex_account_for_upload_rejects_client_id_mismatch():
+    account = SimpleNamespace(
+        email="tester@example.com",
+        access_token="opaque-access-token",
+        refresh_token="refresh-token",
+        client_id="app_old",
+        id_token="",
+        extra_data={"token_source": "oauth"},
+    )
+
+    valid, reason = cpa_upload.validate_codex_account_for_upload(
+        account,
+        expected_client_id="app_expected",
+    )
+
+    assert valid is False
+    assert "client_id 不匹配" in reason

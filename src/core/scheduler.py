@@ -19,6 +19,7 @@ from ..config.settings import get_settings
 from ..config.constants import EmailServiceType
 from .upload.cpa_upload import _normalize_cpa_auth_files_url, _build_cpa_headers
 from ..web.routes.registration import run_batch_registration
+from .pending_oauth import process_pending_oauth_once, get_oauth_pending_overview
 
 logger = logging.getLogger(__name__)
 
@@ -637,6 +638,7 @@ async def trigger_auto_registration(count: int, cpa_service_id: int):
 
 _is_checking = False
 _is_checking_401 = False
+_is_processing_oauth_pending = False
 _pending_check_once = False
 _pending_check_lock = threading.Lock()
 _check_abort_requested = False
@@ -1100,6 +1102,44 @@ def check_cpa_services_job(
             check_cpa_services_job(main_loop, None, allow_queue=False, reason="pending")
 
 
+def process_oauth_pending_job(manual_logs: list = None):
+    """处理待 OAuth 授权队列。"""
+    global _is_processing_oauth_pending
+    if _is_processing_oauth_pending:
+        msg = "待授权队列任务正在执行，本轮跳过。"
+        if manual_logs is not None:
+            manual_logs.append(f"[WARNING] {msg}")
+        append_system_log("warning", msg)
+        return {"picked": 0, "success": 0, "failed": 0, "rate_limited": 0, "requeued": 0, "uploaded": 0}
+
+    _is_processing_oauth_pending = True
+    try:
+        summary = process_pending_oauth_once(logs=manual_logs)
+        overview = get_oauth_pending_overview()
+        append_system_log(
+            "info",
+            "待授权队列处理完成："
+            f"picked={summary.get('picked', 0)}, "
+            f"success={summary.get('success', 0)}, "
+            f"recovered_running={summary.get('recovered_running', 0)}, "
+            f"requeued={summary.get('requeued', 0)}, "
+            f"rate_limited={summary.get('rate_limited', 0)}, "
+            f"failed={summary.get('failed', 0)}, "
+            f"queue_pending={overview.get('pending', 0)}, "
+            f"queue_running={overview.get('running', 0)}, "
+            f"queue_rate_limited={overview.get('rate_limited', 0)}, "
+            f"queue_failed={overview.get('failed', 0)}",
+        )
+        return summary
+    except Exception as e:
+        append_system_log("error", f"待授权队列处理异常: {e}")
+        if manual_logs is not None:
+            manual_logs.append(f"[ERROR] 待授权队列处理异常: {e}")
+        return {"picked": 0, "success": 0, "failed": 0, "rate_limited": 0, "requeued": 0, "uploaded": 0}
+    finally:
+        _is_processing_oauth_pending = False
+
+
 async def _scheduler_loop():
     """调度器主循环"""
     await asyncio.sleep(5) # 启动后延迟 5 秒开始
@@ -1134,9 +1174,27 @@ async def _scheduler_401_loop():
         await asyncio.sleep(interval_min * 60)
 
 
+async def _scheduler_oauth_pending_loop():
+    """待授权 OAuth 定时补授权循环。"""
+    await asyncio.sleep(12)
+    loop = asyncio.get_running_loop()
+    while True:
+        settings = get_settings()
+        try:
+            if settings.oauth_pending_enabled:
+                await loop.run_in_executor(None, process_oauth_pending_job, None)
+        except Exception as e:
+            logger.error(f"Scheduler oauth pending loop exception: {e}")
+        interval_seconds = int(getattr(settings, "oauth_pending_poll_interval_seconds", 60) or 60)
+        if interval_seconds < 10:
+            interval_seconds = 10
+        await asyncio.sleep(interval_seconds)
+
+
 def start_scheduler():
     """启动调度器"""
     logger.info("启动后台调度器，负责定时任务...")
     loop = asyncio.get_event_loop()
     loop.create_task(_scheduler_loop())
     loop.create_task(_scheduler_401_loop())
+    loop.create_task(_scheduler_oauth_pending_loop())

@@ -16,6 +16,7 @@ from ...config.settings import get_settings
 from ...database.session import get_db
 from ...database import crud
 from ...database.models import Account
+from .oauth import is_oauth_token_source
 
 logger = logging.getLogger(__name__)
 
@@ -204,8 +205,8 @@ class TokenRefreshManager:
         刷新账号的 Token
 
         优先级：
-        1. Session Token 刷新
-        2. OAuth Refresh Token 刷新
+        - OAuth 账号：仅 OAuth Refresh Token 刷新（避免混入 Session Token）
+        - 其他账号：Session Token 刷新 -> OAuth Refresh Token 刷新
 
         Args:
             account: 账号对象
@@ -213,22 +214,40 @@ class TokenRefreshManager:
         Returns:
             TokenRefreshResult: 刷新结果
         """
-        # 优先尝试 Session Token
+        extra_data = account.extra_data if isinstance(account.extra_data, dict) else {}
+        token_source = str(extra_data.get("token_source") or "").strip().lower()
+        strict_oauth_account = is_oauth_token_source(token_source) or (
+            bool(account.refresh_token and account.client_id) and not bool(account.session_token)
+        )
+
+        # OAuth 账号：强制走 OAuth 刷新，避免 Session Token 混入导致 client_id 不匹配
+        if strict_oauth_account:
+            if not account.refresh_token:
+                return TokenRefreshResult(
+                    success=False,
+                    error_message="OAuth 账号缺少 refresh_token，无法刷新",
+                )
+            logger.info(f"检测到 OAuth 账号，使用 OAuth Refresh Token 刷新账号 {account.email}")
+            return self.refresh_by_oauth_token(
+                refresh_token=account.refresh_token,
+                client_id=account.client_id
+            )
+
+        # 非 OAuth 账号优先尝试 Session Token
         if account.session_token:
             logger.info(f"尝试使用 Session Token 刷新账号 {account.email}")
             result = self.refresh_by_session_token(account.session_token)
             if result.success:
                 return result
-            logger.warning(f"Session Token 刷新失败，尝试 OAuth 刷新")
+            logger.warning("Session Token 刷新失败，尝试 OAuth 刷新")
 
-        # 尝试 OAuth Refresh Token
+        # 回退 OAuth Refresh Token
         if account.refresh_token:
             logger.info(f"尝试使用 OAuth Refresh Token 刷新账号 {account.email}")
-            result = self.refresh_by_oauth_token(
+            return self.refresh_by_oauth_token(
                 refresh_token=account.refresh_token,
                 client_id=account.client_id
             )
-            return result
 
         # 无可用刷新方式
         return TokenRefreshResult(

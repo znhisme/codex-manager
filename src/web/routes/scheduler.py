@@ -1,10 +1,11 @@
 import logging
 import asyncio
 from typing import Optional
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel
 
 from ...config.settings import get_settings, update_settings
+from ...core.pending_oauth import get_oauth_pending_overview, list_oauth_pending_accounts
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -132,5 +133,53 @@ async def trigger_cpa_scheduler_remove_401():
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, check_cpa_services_401_job, None, manual_logs, True)
         return {"success": True, "logs": manual_logs, "message": "401/403/usage_limit_reached 快速剔除执行完毕！"}
+    except Exception as e:
+        return {"success": False, "logs": manual_logs, "message": str(e)}
+
+
+@router.get("/oauth-pending/status")
+async def get_oauth_pending_status():
+    """获取待 OAuth 授权队列状态。"""
+    settings = get_settings()
+    overview = get_oauth_pending_overview()
+    overview.update(
+        {
+            "enabled": settings.oauth_pending_enabled,
+            "poll_interval_seconds": settings.oauth_pending_poll_interval_seconds,
+            "max_attempts": settings.oauth_pending_max_attempts,
+        }
+    )
+    return {"success": True, "data": overview}
+
+
+@router.get("/oauth-pending/accounts")
+async def get_oauth_pending_accounts(
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=200, description="每页数量"),
+    status: Optional[str] = Query(None, description="待授权状态筛选"),
+):
+    """获取待 OAuth 授权账号列表。"""
+    try:
+        data = list_oauth_pending_accounts(page=page, page_size=page_size, status=status)
+        return {"success": True, "data": data}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/oauth-pending/trigger")
+async def trigger_oauth_pending_once():
+    """手动触发一次待 OAuth 授权补授权任务。"""
+    from ...core.scheduler import process_oauth_pending_job
+
+    manual_logs = []
+    try:
+        loop = asyncio.get_event_loop()
+        summary = await loop.run_in_executor(None, process_oauth_pending_job, manual_logs)
+        return {
+            "success": True,
+            "logs": manual_logs,
+            "summary": summary or {},
+            "message": "待授权补授权执行完毕",
+        }
     except Exception as e:
         return {"success": False, "logs": manual_logs, "message": str(e)}

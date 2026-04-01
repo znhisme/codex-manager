@@ -17,6 +17,7 @@ from ...database import crud
 from ...database.session import get_db
 from ...database.models import RegistrationTask, Proxy
 from ...core.register import RegistrationEngine, RegistrationResult
+from ...core.pending_oauth import upsert_pending_oauth_account_from_result
 from ...services import EmailServiceFactory, EmailServiceType
 from ...config.settings import get_settings
 from ..task_manager import task_manager
@@ -542,33 +543,45 @@ def _run_sync_registration_task(
                 # 自动上传到 CPA（可多服务）
                 if auto_upload_cpa:
                     try:
-                        from ...core.upload.cpa_upload import upload_to_cpa, generate_token_json
+                        from ...core.upload.cpa_upload import (
+                            upload_to_cpa,
+                            generate_token_json,
+                            validate_codex_account_for_upload,
+                        )
                         from ...database.models import Account as AccountModel
                         saved_account = db.query(AccountModel).filter_by(email=result.email).first()
                         if saved_account and saved_account.access_token:
-                            token_data = generate_token_json(saved_account)
-                            _cpa_ids = cpa_service_ids or []
-                            if not _cpa_ids:
-                                # 未指定则取所有启用的服务
-                                _cpa_ids = [s.id for s in crud.get_cpa_services(db, enabled=True)]
-                            if not _cpa_ids:
-                                log_callback("[CPA] 无可用 CPA 服务，跳过上传")
-                            for _sid in _cpa_ids:
-                                try:
-                                    _svc = crud.get_cpa_service_by_id(db, _sid)
-                                    if not _svc:
-                                        continue
-                                    log_callback(f"[CPA] 上传到服务: {_svc.name}")
-                                    _ok, _msg = upload_to_cpa(token_data, api_url=_svc.api_url, api_token=_svc.api_token)
-                                    if _ok:
-                                        saved_account.cpa_uploaded = True
-                                        saved_account.cpa_uploaded_at = datetime.utcnow()
-                                        db.commit()
-                                        log_callback(f"[CPA] 上传成功: {_svc.name}")
-                                    else:
-                                        log_callback(f"[CPA] 上传失败({_svc.name}): {_msg}")
-                                except Exception as _e:
-                                    log_callback(f"[CPA] 异常({_sid}): {_e}")
+                            expected_client_id = str(get_settings().openai_client_id or "").strip()
+                            valid, reason = validate_codex_account_for_upload(
+                                saved_account,
+                                expected_client_id=expected_client_id,
+                            )
+                            if not valid:
+                                log_callback(f"[CPA] 凭证未授权，跳过上传: {reason}")
+                            else:
+                                token_data = generate_token_json(saved_account)
+                                _cpa_ids = cpa_service_ids or []
+                                if not _cpa_ids:
+                                    # 未指定则取所有启用的服务
+                                    _cpa_ids = [s.id for s in crud.get_cpa_services(db, enabled=True)]
+                                if not _cpa_ids:
+                                    log_callback("[CPA] 无可用 CPA 服务，跳过上传")
+                                for _sid in _cpa_ids:
+                                    try:
+                                        _svc = crud.get_cpa_service_by_id(db, _sid)
+                                        if not _svc:
+                                            continue
+                                        log_callback(f"[CPA] 上传到服务: {_svc.name}")
+                                        _ok, _msg = upload_to_cpa(token_data, api_url=_svc.api_url, api_token=_svc.api_token)
+                                        if _ok:
+                                            saved_account.cpa_uploaded = True
+                                            saved_account.cpa_uploaded_at = datetime.utcnow()
+                                            db.commit()
+                                            log_callback(f"[CPA] 上传成功: {_svc.name}")
+                                        else:
+                                            log_callback(f"[CPA] 上传失败({_svc.name}): {_msg}")
+                                    except Exception as _e:
+                                        log_callback(f"[CPA] 异常({_sid}): {_e}")
                     except Exception as cpa_err:
                         log_callback(f"[CPA] 上传异常: {cpa_err}")
 
@@ -635,12 +648,83 @@ def _run_sync_registration_task(
 
                 logger.info(f"注册任务完成: {task_uuid}, 邮箱: {result.email}")
             else:
+                metadata = result.metadata or {}
+                registration_completed = bool(metadata.get("registration_completed"))
+                should_queue_pending_oauth = (
+                    token_mode == "oauth"
+                    and registration_completed
+                    and bool(str(result.email or "").strip())
+                    and bool(str(result.password or "").strip())
+                )
+                logger.info(
+                    "任务 %s OAuth 失败后入队判断: token_mode=%s, registration_completed=%s, has_email=%s, has_password=%s",
+                    task_uuid,
+                    token_mode,
+                    registration_completed,
+                    bool(str(result.email or "").strip()),
+                    bool(str(result.password or "").strip()),
+                )
+
+                if should_queue_pending_oauth:
+                    queued = False
+                    queue_message = ""
+                    queued_account_id = None
+                    try:
+                        queued, queue_message, queued_account_id = upsert_pending_oauth_account_from_result(
+                            result,
+                            proxy_url=actual_proxy_url,
+                        )
+                    except Exception as queue_exc:
+                        queue_message = f"待授权入库异常: {queue_exc}"
+                        logger.exception("任务 %s 待授权入库异常", task_uuid)
+
+                    if queued:
+                        log_callback(
+                            f"[OAuth] 授权未完成，已入待授权库（账号ID: {queued_account_id}）"
+                        )
+                        result_metadata = dict(metadata)
+                        result_metadata.update(
+                            {
+                                "oauth_pending": True,
+                                "oauth_pending_account_id": queued_account_id,
+                                "oauth_pending_message": queue_message,
+                            }
+                        )
+                        result.metadata = result_metadata
+                        if not result.error_message:
+                            result.error_message = "OAuth Token 获取失败，已加入待授权队列"
+
+                        crud.update_registration_task(
+                            db,
+                            task_uuid,
+                            status="completed",
+                            completed_at=datetime.utcnow(),
+                            result=result.to_dict(),
+                        )
+                        task_manager.update_status(task_uuid, "completed", email=result.email)
+                        logger.info(
+                            f"注册任务完成(待授权): {task_uuid}, 邮箱: {result.email}, 账号ID: {queued_account_id}"
+                        )
+                        return
+
+                    logger.warning(
+                        f"任务 {task_uuid} 入待授权库失败: {queue_message}，保持失败状态"
+                    )
+                else:
+                    logger.info(
+                        "任务 %s 未满足待授权入队条件: token_mode=%s, registration_completed=%s",
+                        task_uuid,
+                        token_mode,
+                        registration_completed,
+                    )
+
                 # 更新任务状态为失败
                 crud.update_registration_task(
                     db, task_uuid,
                     status="failed",
                     completed_at=datetime.utcnow(),
-                    error_message=result.error_message
+                    error_message=result.error_message,
+                    result=result.to_dict(),
                 )
 
                 # 更新 TaskManager 状态
@@ -769,6 +853,8 @@ async def run_batch_parallel(
     sub2api_service_ids: List[int] = None,
     auto_upload_tm: bool = False,
     tm_service_ids: List[int] = None,
+    oauth_jitter_min_seconds: int = 0,
+    oauth_jitter_max_seconds: int = 0,
 ):
     """
     并行模式：所有任务同时提交，Semaphore 控制最大并发数
@@ -777,10 +863,14 @@ async def run_batch_parallel(
     add_batch_log, update_batch_status = _make_batch_helpers(batch_id)
     semaphore = asyncio.Semaphore(concurrency)
     counter_lock = asyncio.Lock()
+    jitter_min = max(0.0, float(oauth_jitter_min_seconds or 0))
+    jitter_max = max(jitter_min, float(oauth_jitter_max_seconds or 0))
     if token_mode == "auto":
         add_batch_log("[系统] 并行模式不支持自动切换，已固定使用 OAuth")
         token_mode = "oauth"
     add_batch_log(f"[系统] 并行模式启动，并发数: {concurrency}，总任务: {len(task_uuids)}")
+    if token_mode == "oauth" and jitter_max > 0:
+        add_batch_log(f"[系统] OAuth 启动抖动: {jitter_min:.1f}-{jitter_max:.1f}s")
 
     async def _run_one(idx: int, uuid: str):
         prefix = f"[任务{idx + 1}]"
@@ -790,6 +880,11 @@ async def run_batch_parallel(
             service_type, service_id = email_service_type, email_service_id
         logger.info(f"批量任务 {batch_id}: 任务{idx + 1}/{len(task_uuids)} 开始 ({service_type}:{service_id or 'default'})")
         async with semaphore:
+            if token_mode == "oauth" and jitter_max > 0:
+                jitter_delay = random.uniform(jitter_min, jitter_max)
+                if jitter_delay > 0:
+                    add_batch_log(f"{prefix} [节流] OAuth 启动等待 {jitter_delay:.1f}s")
+                    await asyncio.sleep(jitter_delay)
             await run_registration_task(
                 uuid, service_type, proxy, email_service_config, service_id,
                 token_mode, log_prefix=prefix, batch_id=batch_id,
@@ -846,6 +941,8 @@ async def run_batch_pipeline(
     sub2api_service_ids: List[int] = None,
     auto_upload_tm: bool = False,
     tm_service_ids: List[int] = None,
+    oauth_jitter_min_seconds: int = 0,
+    oauth_jitter_max_seconds: int = 0,
 ):
     """
     流水线模式：每隔 interval 秒启动一个新任务，Semaphore 限制最大并发数
@@ -855,6 +952,8 @@ async def run_batch_pipeline(
     semaphore = asyncio.Semaphore(concurrency)
     counter_lock = asyncio.Lock()
     running_tasks_list = []
+    jitter_min = max(0.0, float(oauth_jitter_min_seconds or 0))
+    jitter_max = max(jitter_min, float(oauth_jitter_max_seconds or 0))
     add_batch_log(f"[系统] 流水线模式启动，并发数: {concurrency}，总任务: {len(task_uuids)}")
 
     auto_token_mode = token_mode == "auto"
@@ -875,6 +974,10 @@ async def run_batch_pipeline(
                 f"[系统] Token 自动模式启用：前 {sample_total} 个使用 OAuth 采样，"
                 f"成功 < {auto_min_success} 将切换 Session"
             )
+        if jitter_max > 0:
+            add_batch_log(f"[系统] OAuth 启动抖动: {jitter_min:.1f}-{jitter_max:.1f}s")
+    elif token_mode == "oauth" and jitter_max > 0:
+        add_batch_log(f"[系统] OAuth 启动抖动: {jitter_min:.1f}-{jitter_max:.1f}s")
 
     async def _run_and_release(idx: int, uuid: str, pfx: str, mode_for_task: str, is_sample: bool):
         nonlocal auto_use_mode, sample_completed, sample_success
@@ -883,6 +986,11 @@ async def run_batch_pipeline(
                 service_type, service_id = email_service_pool[idx % len(email_service_pool)]
             else:
                 service_type, service_id = email_service_type, email_service_id
+            if mode_for_task == "oauth" and jitter_max > 0:
+                jitter_delay = random.uniform(jitter_min, jitter_max)
+                if jitter_delay > 0:
+                    add_batch_log(f"{pfx} [节流] OAuth 启动等待 {jitter_delay:.1f}s")
+                    await asyncio.sleep(jitter_delay)
             await run_registration_task(
                 uuid, service_type, proxy, email_service_config, service_id,
                 mode_for_task, log_prefix=pfx, batch_id=batch_id,
@@ -1009,24 +1117,49 @@ async def run_batch_registration(
     sub2api_service_ids: List[int] = None,
     auto_upload_tm: bool = False,
     tm_service_ids: List[int] = None,
+    oauth_jitter_min_seconds: Optional[int] = None,
+    oauth_jitter_max_seconds: Optional[int] = None,
 ):
     """根据 mode 分发到并行或流水线执行"""
+    settings = get_settings()
+    effective_concurrency = max(1, min(50, int(concurrency or 1)))
+    if token_mode in ("oauth", "auto"):
+        oauth_limit = max(0, int(settings.batch_oauth_max_concurrency or 0))
+        if oauth_limit > 0:
+            effective_concurrency = min(effective_concurrency, oauth_limit)
+    effective_jitter_min = int(
+        oauth_jitter_min_seconds
+        if oauth_jitter_min_seconds is not None
+        else settings.batch_oauth_start_jitter_min_seconds
+    )
+    effective_jitter_max = int(
+        oauth_jitter_max_seconds
+        if oauth_jitter_max_seconds is not None
+        else settings.batch_oauth_start_jitter_max_seconds
+    )
+    effective_jitter_min = max(0, effective_jitter_min)
+    effective_jitter_max = max(effective_jitter_min, max(0, effective_jitter_max))
+
     if mode == "parallel":
         await run_batch_parallel(
             batch_id, task_uuids, email_service_type, proxy,
-            email_service_config, email_service_id, concurrency, token_mode, email_service_pool,
+            email_service_config, email_service_id, effective_concurrency, token_mode, email_service_pool,
             auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids,
             auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids,
             auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids,
+            oauth_jitter_min_seconds=effective_jitter_min,
+            oauth_jitter_max_seconds=effective_jitter_max,
         )
     else:
         await run_batch_pipeline(
             batch_id, task_uuids, email_service_type, proxy,
             email_service_config, email_service_id,
-            interval_min, interval_max, concurrency, token_mode, email_service_pool,
+            interval_min, interval_max, effective_concurrency, token_mode, email_service_pool,
             auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids,
             auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids,
             auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids,
+            oauth_jitter_min_seconds=effective_jitter_min,
+            oauth_jitter_max_seconds=effective_jitter_max,
         )
 
 
@@ -1158,6 +1291,10 @@ async def start_batch_registration(
     global_limit = settings.global_concurrency or 0
     if global_limit > 0:
         request.concurrency = min(request.concurrency, global_limit)
+    if token_mode in ("oauth", "auto"):
+        oauth_limit = max(0, int(settings.batch_oauth_max_concurrency or 0))
+        if oauth_limit > 0:
+            request.concurrency = min(request.concurrency, oauth_limit)
     if request.concurrency < 1:
         request.concurrency = 1
     if request.concurrency > 50:
@@ -1170,6 +1307,13 @@ async def start_batch_registration(
         f"批量注册启动: 数量={request.count}, 并发={request.concurrency}, "
         f"模式={request.mode}, 间隔={request.interval_min}-{request.interval_max}s"
     )
+    if token_mode in ("oauth", "auto"):
+        logger.info(
+            "批量 OAuth 节流参数: max_concurrency=%s, jitter=%ss-%ss",
+            settings.batch_oauth_max_concurrency,
+            settings.batch_oauth_start_jitter_min_seconds,
+            settings.batch_oauth_start_jitter_max_seconds,
+        )
 
     # 创建批量任务
     batch_id = str(uuid.uuid4())
@@ -1210,6 +1354,8 @@ async def start_batch_registration(
         request.sub2api_service_ids,
         request.auto_upload_tm,
         request.tm_service_ids,
+        settings.batch_oauth_start_jitter_min_seconds,
+        settings.batch_oauth_start_jitter_max_seconds,
     )
 
     return BatchRegistrationResponse(
@@ -1683,7 +1829,13 @@ async def start_outlook_batch_registration(
         raise HTTPException(status_code=400, detail=str(e))
 
     from ...config.settings import get_settings
-    request.concurrency = get_settings().global_concurrency
+    settings = get_settings()
+    request.concurrency = max(1, int(settings.global_concurrency or 1))
+    if token_mode in ("oauth", "auto"):
+        oauth_limit = max(0, int(settings.batch_oauth_max_concurrency or 0))
+        if oauth_limit > 0:
+            request.concurrency = min(request.concurrency, oauth_limit)
+    request.concurrency = max(1, min(50, int(request.concurrency)))
 
     # 过滤掉已注册的邮箱
     actual_service_ids = request.service_ids

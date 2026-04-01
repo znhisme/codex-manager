@@ -10,8 +10,10 @@ from typing import List, Tuple, Optional
 
 from curl_cffi import requests as cffi_requests
 
+from ...config.settings import get_settings
 from ...database.session import get_db
 from ...database.models import Account
+from .cpa_upload import validate_codex_account_for_upload
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +48,18 @@ def upload_to_sub2api(
         return False, "Sub2API API Key 未配置"
 
     exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    expected_client_id = str(get_settings().openai_client_id or "").strip()
 
     account_items = []
+    invalid_reasons: List[str] = []
     for acc in accounts:
-        if not acc.access_token:
+        valid, reason = validate_codex_account_for_upload(
+            acc,
+            expected_client_id=expected_client_id,
+        )
+        if not valid:
+            invalid_reasons.append(f"{acc.email}: {reason}")
+            logger.warning("Sub2API 上传跳过账号 %s: %s", acc.email, reason)
             continue
         expires_at = int(acc.expires_at.timestamp()) if acc.expires_at else 0
         account_items.append({
@@ -85,6 +95,8 @@ def upload_to_sub2api(
         })
 
     if not account_items:
+        if invalid_reasons:
+            return False, f"无可上传账号，未通过授权校验：{invalid_reasons[0]}"
         return False, "所有账号均缺少 access_token，无法上传"
 
     payload = {
@@ -151,6 +163,7 @@ def batch_upload_to_sub2api(
         "skipped_count": 0,
         "details": []
     }
+    expected_client_id = str(get_settings().openai_client_id or "").strip()
 
     with get_db() as db:
         accounts = []
@@ -163,6 +176,19 @@ def batch_upload_to_sub2api(
             if not acc.access_token:
                 results["skipped_count"] += 1
                 results["details"].append({"id": account_id, "email": acc.email, "success": False, "error": "缺少 access_token"})
+                continue
+            valid, reason = validate_codex_account_for_upload(
+                acc,
+                expected_client_id=expected_client_id,
+            )
+            if not valid:
+                results["skipped_count"] += 1
+                results["details"].append({
+                    "id": account_id,
+                    "email": acc.email,
+                    "success": False,
+                    "error": f"凭证未授权：{reason}",
+                })
                 continue
             accounts.append(acc)
 

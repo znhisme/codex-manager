@@ -15,6 +15,7 @@ from curl_cffi import CurlMime
 from ...database.session import get_db
 from ...database.models import Account
 from ...config.settings import get_settings
+from ..openai.oauth import is_oauth_token_source, validate_token_binding
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,60 @@ def _resolve_user_agent(account: Account) -> str:
         if isinstance(ua, str) and ua.strip():
             return ua.strip()
     return ""
+
+
+def _resolve_token_source(account: Account) -> str:
+    """从账号元信息中提取 token 来源。"""
+    extra = account.extra_data
+    if isinstance(extra, dict):
+        return str(extra.get("token_source") or "").strip().lower()
+    return ""
+
+
+def validate_codex_account_for_upload(
+    account: Account,
+    expected_client_id: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """
+    校验账号是否可作为 Codex OAuth 凭证上传。
+
+    规则：
+    - 必须有 access_token + refresh_token；
+    - 必须有 client_id，且与当前配置一致；
+    - 如果 metadata 里标记了 token_source，必须是 OAuth 来源；
+    - 若 token claim 可解析，则校验 client_id/audience 与目标 client_id 一致。
+    """
+    if not account.access_token:
+        return False, "缺少 access_token"
+
+    token_source = _resolve_token_source(account)
+    if token_source and not is_oauth_token_source(token_source):
+        return False, f"token_source={token_source} 非 OAuth 授权凭证"
+
+    refresh_token = str(account.refresh_token or "").strip()
+    if not refresh_token:
+        return False, "缺少 refresh_token，疑似 Session Token"
+
+    account_client_id = str(account.client_id or "").strip()
+    if not account_client_id:
+        return False, "缺少 client_id"
+
+    expected = str(expected_client_id or "").strip()
+    if expected and account_client_id != expected:
+        return False, f"client_id 不匹配: {account_client_id}"
+
+    ok, reason, _profile = validate_token_binding(
+        expected_client_id=expected or account_client_id,
+        access_token=account.access_token or "",
+        id_token=account.id_token or "",
+        refresh_token=refresh_token,
+        token_source=token_source,
+        require_refresh_token=True,
+    )
+    if not ok:
+        return False, reason
+
+    return True, ""
 
 
 def generate_token_json(account: Account) -> dict:
@@ -253,6 +308,8 @@ def batch_upload_to_cpa(
         "skipped_count": 0,
         "details": []
     }
+    settings = get_settings()
+    expected_client_id = str(settings.openai_client_id or "").strip()
 
     with get_db() as db:
         for account_id in account_ids:
@@ -276,6 +333,20 @@ def batch_upload_to_cpa(
                     "email": account.email,
                     "success": False,
                     "error": "缺少 Token"
+                })
+                continue
+
+            valid, invalid_reason = validate_codex_account_for_upload(
+                account,
+                expected_client_id=expected_client_id,
+            )
+            if not valid:
+                results["skipped_count"] += 1
+                results["details"].append({
+                    "id": account_id,
+                    "email": account.email,
+                    "success": False,
+                    "error": f"凭证未授权：{invalid_reason}",
                 })
                 continue
 

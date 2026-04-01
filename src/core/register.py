@@ -15,6 +15,7 @@ import uuid
 import hashlib
 import base64
 import html
+import threading
 from typing import Optional, Dict, Any, Tuple, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,6 +42,9 @@ from ..config.constants import (
 from ..config.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+_OAUTH_RATE_LIMIT_UNTIL_TS: float = 0.0
+_OAUTH_RATE_LIMIT_LOCK = threading.Lock()
 
 # ================= Chrome Fingerprints =================
 _CHROME_PROFILES = [
@@ -303,7 +307,7 @@ class RegistrationEngine:
     ):
         self.email_service = email_service
         self.proxy_url = proxy_url
-        self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
+        self.callback_logger = callback_logger
         self.task_uuid = task_uuid
         self.token_mode = (token_mode or "session").strip().lower()
         if self.token_mode not in ("session", "oauth"):
@@ -355,6 +359,25 @@ class RegistrationEngine:
             self.request_retries = max(1, int(settings.registration_max_retries or 3))
         except Exception:
             self.request_retries = 3
+        try:
+            self.oauth_rate_limit_cooldown_seconds = max(
+                0, int(settings.oauth_rate_limit_cooldown_seconds or 0)
+            )
+        except Exception:
+            self.oauth_rate_limit_cooldown_seconds = 0
+        try:
+            self.oauth_rate_limit_backoff_base_seconds = max(
+                1, int(settings.oauth_rate_limit_backoff_base_seconds or 6)
+            )
+        except Exception:
+            self.oauth_rate_limit_backoff_base_seconds = 6
+        try:
+            self.oauth_rate_limit_backoff_max_seconds = max(
+                self.oauth_rate_limit_backoff_base_seconds,
+                int(settings.oauth_rate_limit_backoff_max_seconds or 60),
+            )
+        except Exception:
+            self.oauth_rate_limit_backoff_max_seconds = 60
 
     def _log(self, message: str, level: str = "info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -368,9 +391,12 @@ class RegistrationEngine:
                     crud.append_task_log(db, self.task_uuid, log_message)
             except Exception as e:
                 logger.warning(f"记录任务日志失败: {e}")
-        if level == "error": logger.error(message)
-        elif level == "warning": logger.warning(message)
-        else: logger.info(message)
+        if level == "error":
+            logger.error(log_message)
+        elif level == "warning":
+            logger.warning(log_message)
+        else:
+            logger.info(log_message)
 
     def _request_with_retry(
         self,
@@ -405,6 +431,50 @@ class RegistrationEngine:
             else:
                 self._log(f"请求最终失败: {last_err}", "error")
         return None
+
+    def _oauth_is_rate_limited(self, message: str) -> bool:
+        text = str(message or "").lower()
+        if not text:
+            return False
+        return "429" in text or "rate limit" in text or "too many requests" in text
+
+    def _oauth_compute_backoff_seconds(self, attempt: int) -> int:
+        attempt_idx = max(1, int(attempt or 1))
+        base = max(1, int(self.oauth_rate_limit_backoff_base_seconds or 1))
+        upper = max(base, int(self.oauth_rate_limit_backoff_max_seconds or base))
+        return min(upper, base * attempt_idx)
+
+    def _oauth_apply_global_cooldown(self, seconds: int) -> float:
+        if seconds <= 0:
+            return 0.0
+        global _OAUTH_RATE_LIMIT_UNTIL_TS
+        target_until = time.time() + float(seconds)
+        with _OAUTH_RATE_LIMIT_LOCK:
+            if target_until > _OAUTH_RATE_LIMIT_UNTIL_TS:
+                _OAUTH_RATE_LIMIT_UNTIL_TS = target_until
+            remaining = max(0.0, _OAUTH_RATE_LIMIT_UNTIL_TS - time.time())
+        return remaining
+
+    def _oauth_wait_global_cooldown_if_needed(self) -> None:
+        with _OAUTH_RATE_LIMIT_LOCK:
+            remaining = max(0.0, _OAUTH_RATE_LIMIT_UNTIL_TS - time.time())
+        if remaining <= 0:
+            return
+        wait_seconds = max(1, int(remaining))
+        self._log(f"检测到 OAuth 全局冷却，等待 {wait_seconds}s 后继续", "warning")
+        time.sleep(remaining)
+
+    def _oauth_handle_rate_limit(self, attempt: int, *, stage: str = "OAuth") -> None:
+        backoff_seconds = self._oauth_compute_backoff_seconds(attempt)
+        cooldown_seconds = max(backoff_seconds, int(self.oauth_rate_limit_cooldown_seconds or 0))
+        remaining = self._oauth_apply_global_cooldown(cooldown_seconds)
+        global_cooldown = max(backoff_seconds, int(remaining))
+        self._log(
+            f"{stage} 命中限流，已设置全局冷却 {global_cooldown}s（本次退避={backoff_seconds}s）",
+            "warning",
+        )
+        if backoff_seconds > 0:
+            time.sleep(backoff_seconds)
 
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
         return ''.join(secrets.choice(PASSWORD_CHARSET) for _ in range(length))
@@ -551,7 +621,14 @@ class RegistrationEngine:
         self._log(f"Validate OTP -> {r.status_code}")
         return r.status_code, data
 
-    def create_account(self, name: str, birthdate: str, so_token: str = None):
+    def create_account(
+        self,
+        name: str,
+        birthdate: str,
+        so_token: str = None,
+        timeout: Optional[int] = None,
+        retries: Optional[int] = None,
+    ):
         url = f"{self.AUTH}/api/accounts/create_account"
         headers = {
             "Content-Type": "application/json", "Accept": "application/json",
@@ -569,6 +646,8 @@ class RegistrationEngine:
             "post",
             url,
             label="Create Account",
+            timeout=timeout,
+            retries=retries,
             json=payload,
             headers=headers,
             impersonate=self.impersonate,
@@ -588,6 +667,8 @@ class RegistrationEngine:
                     "post",
                     url,
                     label="Create Account(重试)",
+                    timeout=timeout,
+                    retries=retries,
                     json=payload,
                     headers=headers,
                     impersonate=self.impersonate,
@@ -756,6 +837,347 @@ class RegistrationEngine:
             return action
         return None
 
+    def _extract_first_form_action(self, text: str) -> Optional[str]:
+        """提取页面中第一个表单 action。"""
+        if not text:
+            return None
+        for tag in re.findall(r"<form[^>]+>", text, flags=re.IGNORECASE):
+            action_match = re.search(r'action=["\\\']([^"\\\']+)["\\\']', tag, flags=re.IGNORECASE)
+            if not action_match:
+                continue
+            action = html.unescape(action_match.group(1))
+            if action.startswith("/"):
+                return urljoin(self.AUTH, action)
+            return action
+        return None
+
+    def _extract_submit_field(self, text: str) -> Dict[str, str]:
+        """提取“继续/同意”按钮字段，用于模拟点击提交。"""
+        if not text:
+            return {}
+
+        consent_keywords = ("continue", "继续", "allow", "同意", "accept", "authorize", "授权")
+
+        # 优先匹配 button（type=submit 或省略 type）
+        for tag in re.findall(r"<button[^>]*>.*?</button>", text, flags=re.IGNORECASE | re.DOTALL):
+            open_tag_match = re.search(r"<button[^>]*>", tag, flags=re.IGNORECASE)
+            if not open_tag_match:
+                continue
+            open_tag = open_tag_match.group(0)
+
+            type_match = re.search(r'type=["\\\']([^"\\\']+)["\\\']', open_tag, flags=re.IGNORECASE)
+            if type_match and (type_match.group(1) or "").strip().lower() not in ("submit", ""):
+                continue
+
+            inner_text = re.sub(r"<[^>]+>", "", tag)
+            inner_text = html.unescape(inner_text).strip().lower()
+            attrs_text = html.unescape(open_tag).lower()
+            value_match = re.search(r'value=["\\\']([^"\\\']*)["\\\']', open_tag, flags=re.IGNORECASE)
+            value_text = html.unescape(value_match.group(1)).strip().lower() if value_match else ""
+            if not any(key in f"{inner_text} {attrs_text} {value_text}" for key in consent_keywords):
+                continue
+
+            name_match = re.search(r'name=["\\\']([^"\\\']+)["\\\']', open_tag, flags=re.IGNORECASE)
+            if name_match:
+                return {
+                    html.unescape(name_match.group(1)): html.unescape(value_match.group(1)) if value_match else "1"
+                }
+            return {}
+
+        # 回退匹配 input[type=submit|button]
+        for tag in re.findall(r"<input[^>]+>", text, flags=re.IGNORECASE):
+            type_match = re.search(r'type=["\\\']([^"\\\']+)["\\\']', tag, flags=re.IGNORECASE)
+            input_type = (type_match.group(1) if type_match else "").strip().lower()
+            if input_type not in ("submit", "button"):
+                continue
+
+            value_match = re.search(r'value=["\\\']([^"\\\']*)["\\\']', tag, flags=re.IGNORECASE)
+            value_text = html.unescape(value_match.group(1)).strip().lower() if value_match else ""
+            attrs_text = html.unescape(tag).lower()
+            if not any(key in f"{attrs_text} {value_text}" for key in consent_keywords):
+                continue
+
+            name_match = re.search(r'name=["\\\']([^"\\\']+)["\\\']', tag, flags=re.IGNORECASE)
+            if name_match:
+                return {html.unescape(name_match.group(1)): html.unescape(value_match.group(1)) if value_match else "1"}
+            return {}
+
+        return {}
+
+    def _extract_navigation_url_from_html(self, text: str, base_url: str = "") -> Optional[str]:
+        """从 HTML 中提取前端跳转 URL（允许非 redirect_uri 前缀）。"""
+        if not text:
+            return None
+
+        def _normalize(candidate: str) -> str:
+            value = html.unescape(candidate or "").strip()
+            if not value:
+                return ""
+            if value.startswith("/") and base_url:
+                return urljoin(base_url, value)
+            return value
+
+        def _is_static_asset(url: str) -> bool:
+            lowered = (url or "").lower().split("?", 1)[0].split("#", 1)[0]
+            static_suffixes = (
+                ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
+                ".css", ".js", ".mjs", ".map", ".woff", ".woff2", ".ttf", ".otf",
+            )
+            if lowered.endswith(static_suffixes):
+                return True
+            if "auth-cdn.oaistatic.com/assets/" in lowered:
+                return True
+            return False
+
+        patterns = (
+            r'http-equiv=["\']refresh["\']\s+content=["\']\d+;\s*url=([^"\']+)["\']',
+            r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']',
+            r'location\.href\s*=\s*["\']([^"\']+)["\']',
+            r'location\s*=\s*["\']([^"\']+)["\']',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            candidate = _normalize(match.group(1) or "")
+            if not candidate or _is_static_asset(candidate):
+                continue
+            return candidate
+
+        preferred_candidates: list[str] = []
+        fallback_candidates: list[str] = []
+        for match in re.findall(r"https?://[^\s\"'>]+", text):
+            candidate = _normalize(match or "")
+            if not candidate or _is_static_asset(candidate):
+                continue
+
+            lowered = candidate.lower()
+            if any(
+                marker in lowered
+                for marker in (
+                    "code=",
+                    "/oauth",
+                    "/authorize",
+                    "/consent",
+                    "/callback",
+                    "redirect_uri=",
+                    "/workspace",
+                    "/organization",
+                    "/continue",
+                )
+            ):
+                preferred_candidates.append(candidate)
+            else:
+                fallback_candidates.append(candidate)
+
+        if preferred_candidates:
+            return preferred_candidates[0]
+        if fallback_candidates:
+            return fallback_candidates[0]
+
+        return None
+
+    def _oauth_submit_authorize_continue_api(
+        self,
+        session: cffi_requests.Session,
+        page_url: str,
+        redirect_uri: str,
+    ) -> Optional[str]:
+        """Consent 兜底：调用 authorize/continue API 后继续提取 code。"""
+        payload_candidates = ({"action": "default"}, {"action": "accept"}, {})
+        for payload in payload_candidates:
+            try:
+                resp = session.post(
+                    OPENAI_API_ENDPOINTS["signup"],
+                    headers={
+                        "referer": page_url,
+                        "accept": "application/json",
+                        "content-type": "application/json",
+                    },
+                    data=json.dumps(payload),
+                    timeout=20,
+                    allow_redirects=False,
+                )
+            except Exception as e:
+                self._log(f"Consent API 兜底请求异常: {e}", "warning")
+                continue
+
+            self._log(f"Consent API 兜底状态: {resp.status_code} (payload={payload})")
+
+            if resp.status_code in (301, 302, 303, 307, 308):
+                loc = resp.headers.get("Location", "")
+                self._raise_if_phone_required(url=loc, stage="OAuth Consent API 兜底(Location)")
+                code = _extract_code_from_url(loc)
+                if code:
+                    return code
+                if loc:
+                    code = self._oauth_follow_and_extract_code(session, loc)
+                    if code:
+                        return code
+                continue
+
+            continue_url = ""
+            page_type = ""
+            response_text = resp.text or ""
+            if resp.status_code == 200:
+                try:
+                    resp_data = resp.json() if response_text else {}
+                except Exception:
+                    resp_data = {}
+                continue_url = str((resp_data or {}).get("continue_url") or "").strip()
+                page_type = str((((resp_data or {}).get("page") or {}).get("type")) or "")
+                self._raise_if_phone_required(
+                    url=continue_url,
+                    page_type=page_type,
+                    text=response_text,
+                    stage="OAuth Consent API 兜底",
+                )
+
+            if continue_url:
+                next_url = continue_url if continue_url.startswith("http") else f"{self.oauth_issuer}{continue_url}"
+                code = _extract_code_from_url(next_url) or self._oauth_follow_and_extract_code(session, next_url)
+                if code:
+                    return code
+
+            callback_url = self._extract_redirect_from_html(response_text, redirect_uri)
+            if callback_url:
+                code = _extract_code_from_url(callback_url)
+                if code:
+                    return code
+
+            nav_url = self._extract_navigation_url_from_html(response_text, base_url=str(resp.url))
+            if nav_url:
+                code = _extract_code_from_url(nav_url) or self._oauth_follow_and_extract_code(session, nav_url)
+                if code:
+                    return code
+
+        return None
+
+    def _oauth_submit_consent_form(
+        self,
+        session: cffi_requests.Session,
+        page_url: str,
+        html_text: str,
+        redirect_uri: str,
+    ) -> Optional[str]:
+        """提交 OAuth 同意页表单，提取授权码。"""
+        try:
+            action_url: Optional[str] = None
+            payload: Dict[str, str] = {}
+
+            forms = re.findall(r"<form[^>]*>.*?</form>", html_text, flags=re.IGNORECASE | re.DOTALL)
+            if forms:
+                ranked_forms: list[tuple[int, str, Dict[str, str], Dict[str, str]]] = []
+                for form_html in forms:
+                    open_tag_match = re.search(r"<form[^>]*>", form_html, flags=re.IGNORECASE)
+                    if not open_tag_match:
+                        continue
+                    open_tag = open_tag_match.group(0)
+                    action_match = re.search(r'action=["\\\']([^"\\\']*)["\\\']', open_tag, flags=re.IGNORECASE)
+                    action_raw = html.unescape((action_match.group(1) if action_match else "").strip())
+                    candidate_action = urljoin(page_url, action_raw) if action_raw else page_url
+
+                    candidate_payload = self._extract_hidden_inputs(form_html)
+                    submit_payload = self._extract_submit_field(form_html)
+
+                    candidate_text = f"{open_tag} {form_html}".lower()
+                    score = 0
+                    if "/sign-in-with-chatgpt/codex/consent" in (action_raw or ""):
+                        score += 200
+                    if "/api/accounts/authorize/continue" in (action_raw or ""):
+                        score += 180
+                    if any(k in candidate_text for k in ("continue", "继续", "allow", "同意", "accept", "authorize", "授权")):
+                        score += 60
+                    if submit_payload:
+                        score += 30
+                    if action_raw:
+                        score += 10
+
+                    ranked_forms.append((score, candidate_action, candidate_payload, submit_payload))
+
+                if ranked_forms:
+                    ranked_forms.sort(key=lambda item: item[0], reverse=True)
+                    best_score, action_url, payload, submit_payload = ranked_forms[0]
+                    payload.update(submit_payload)
+                    self._log(
+                        f"Consent 表单已选中(score={best_score}) action={action_url[:120]}..., "
+                        f"hidden={len(payload)}, submit={len(submit_payload)}"
+                    )
+
+            if not action_url:
+                # 回退旧逻辑：尽力找到 action，没有则默认回发当前页面
+                action_url = (
+                    self._extract_form_action(html_text, "/sign-in-with-chatgpt/codex/consent")
+                    or self._extract_form_action(html_text, "/api/accounts/authorize/continue")
+                    or self._extract_first_form_action(html_text)
+                    or page_url
+                )
+                payload = self._extract_hidden_inputs(html_text)
+                payload.update(self._extract_submit_field(html_text))
+
+            if "action" not in payload:
+                payload["action"] = "default"
+
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": self.AUTH,
+                "Referer": page_url,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+            resp = session.post(
+                action_url,
+                data=payload,
+                headers=headers,
+                timeout=30,
+                allow_redirects=False,
+            )
+
+            self._log(f"Consent 表单提交状态: {resp.status_code}, URL: {str(resp.url)[:120]}...")
+
+            self._raise_if_phone_required(
+                url=str(resp.url),
+                text=resp.text or "",
+                stage="OAuth Consent 提交",
+            )
+
+            if resp.status_code in (301, 302, 303, 307, 308):
+                loc = resp.headers.get("Location", "")
+                self._raise_if_phone_required(url=loc, stage="OAuth Consent 提交(Location)")
+                code = _extract_code_from_url(loc)
+                if code:
+                    return code
+                if loc:
+                    return self._oauth_follow_and_extract_code(session, loc)
+                return None
+
+            callback_url = self._extract_redirect_from_html(resp.text or "", redirect_uri)
+            if callback_url:
+                return _extract_code_from_url(callback_url)
+
+            nav_url = self._extract_navigation_url_from_html(resp.text or "", base_url=str(resp.url))
+            if nav_url:
+                self._log(f"Consent 响应提取到跳转 URL: {nav_url[:120]}...")
+                code = _extract_code_from_url(nav_url)
+                if code:
+                    return code
+                code = self._oauth_follow_and_extract_code(session, nav_url)
+                if code:
+                    return code
+
+            api_fallback_code = self._oauth_submit_authorize_continue_api(
+                session,
+                page_url=page_url,
+                redirect_uri=redirect_uri,
+            )
+            if api_fallback_code:
+                return api_fallback_code
+
+            # 页面无直接 callback，尝试继续跟随当前 URL
+            return self._oauth_follow_and_extract_code(session, str(resp.url))
+        except Exception as e:
+            self._log(f"提交 Consent 表单失败: {e}", "warning")
+            return None
+
     def _looks_like_login_page(self, url: str, text: str) -> bool:
         url_lower = (url or "").lower()
         if "/u/login/" in url_lower:
@@ -814,16 +1236,44 @@ class RegistrationEngine:
             raise OAuthPhoneRequiredError(msg)
 
     def _handle_about_you(self, source: str) -> bool:
-        """在 OAuth 登录流程中遇到 about_you 时补全资料并准备重新授权。"""
+        """在 OAuth 登录流程中遇到 about_you 时补全资料并尽量继续授权。"""
         try:
             user_info = generate_random_user_info()
             name = user_info.get("name") or "User"
             birthdate = user_info.get("birthdate") or "1990-01-01"
-            self._log(f"{source}命中 about-you，提交资料后重试 OAuth 授权", "warning")
-            status, _data = self.create_account(name, birthdate)
-            if status == 200:
-                # 尝试回调完成流程
-                self.callback()
+            self._log(f"{source}命中 about-you，尝试补全资料并继续 OAuth 授权", "warning")
+            about_you_timeout = max(8, min(int(self.request_timeout or 30), 25))
+            try:
+                status, data = self.create_account(
+                    name,
+                    birthdate,
+                    timeout=about_you_timeout,
+                    retries=1,
+                )
+            except TypeError:
+                # 兼容旧签名/测试替身：create_account(name, birthdate, so_token=None)
+                status, data = self.create_account(name, birthdate)
+            if status in (200, 409):
+                if status == 409:
+                    self._log("about-you 返回 409（资料已存在），视为可继续授权", "warning")
+                # callback 失败不阻断，后续继续走 consent/workspace 提取 code
+                try:
+                    self.callback()
+                except Exception as cb_err:
+                    self._log(f"about-you 回调阶段异常（忽略继续）: {cb_err}", "warning")
+                return True
+            if status == 0:
+                reason = ""
+                if isinstance(data, dict):
+                    reason = str(data.get("error") or "")
+                self._log(
+                    f"about-you 提交超时或请求失败({reason or 'request_failed'})，按可继续授权处理",
+                    "warning",
+                )
+                try:
+                    self.callback()
+                except Exception as cb_err:
+                    self._log(f"about-you 超时后的回调阶段异常（忽略继续）: {cb_err}", "warning")
                 return True
             self._log(f"about-you 提交失败: HTTP {status}", "warning")
             return False
@@ -1279,36 +1729,74 @@ class RegistrationEngine:
                 continue
         return None
 
-    def _oauth_get_workspace_id(self, session: cffi_requests.Session) -> Optional[str]:
-        """获取 Workspace ID（OAuth 登录流程）。"""
-        try:
-            cookie_values = self._extract_cookie_values(session, "oai-client-auth-session")
-            if not cookie_values:
-                self._log("未能获取到授权 Cookie", "error")
-                return None
+    def _extract_workspace_id_from_cookie(self, raw_value: str) -> Optional[str]:
+        """从授权相关 Cookie 值中提取 workspace_id。"""
+        if not raw_value:
+            return None
 
-            payload = None
-            for raw_cookie in cookie_values:
-                payload = self._decode_oauth_session_cookie(raw_cookie)
-                if payload:
-                    break
+        candidates = [raw_value]
+        if "." in raw_value:
+            candidates.extend(str(raw_value).split("."))
 
-            if not payload:
-                self._log("授权 Cookie 解析失败", "error")
-                return None
+        for candidate in candidates:
+            payload = self._decode_oauth_session_cookie(candidate)
+            if not isinstance(payload, dict):
+                continue
 
             workspaces = payload.get("workspaces") or []
-            if not workspaces:
-                self._log(f"授权 Cookie 里没有 workspace 信息 (keys: {list(payload.keys())})", "error")
-                return None
+            if isinstance(workspaces, list):
+                for workspace in workspaces:
+                    workspace_id = str((workspace or {}).get("id") or "").strip()
+                    if workspace_id:
+                        return workspace_id
 
-            workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
-            if not workspace_id:
-                self._log("无法解析 workspace_id", "error")
-                return None
+            for key in ("workspace_id", "workspaceId"):
+                workspace_id = str(payload.get(key) or "").strip()
+                if workspace_id:
+                    return workspace_id
 
-            self._log(f"Workspace ID: {workspace_id}")
-            return workspace_id
+        return None
+
+    def _oauth_get_workspace_id(
+        self,
+        session: cffi_requests.Session,
+        consent_url: str = "",
+    ) -> Optional[str]:
+        """获取 Workspace ID（OAuth 登录流程）。"""
+        try:
+            cookie_names = (
+                "oai-client-auth-session",
+                "oai_client_auth_session",
+                "oai-client-auth-info",
+                "oai_client_auth_info",
+            )
+            for cookie_name in cookie_names:
+                cookie_values = self._extract_cookie_values(session, cookie_name)
+                for raw_cookie in cookie_values:
+                    workspace_id = self._extract_workspace_id_from_cookie(raw_cookie)
+                    if workspace_id:
+                        self._log(f"Workspace ID: {workspace_id} (from {cookie_name})")
+                        return workspace_id
+
+            page_candidates = []
+            if consent_url:
+                page_candidates.append(consent_url)
+            page_candidates.append(f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent")
+            pattern = re.compile(r'"workspace_id"\s*:\s*"([^"]+)"')
+            for page_url in page_candidates:
+                try:
+                    response = session.get(page_url, timeout=15)
+                    match = pattern.search(response.text or "")
+                    if match:
+                        workspace_id = str(match.group(1) or "").strip()
+                        if workspace_id:
+                            self._log(f"Workspace ID: {workspace_id} (from page)")
+                            return workspace_id
+                except Exception:
+                    continue
+
+            self._log("未能从 Cookie/页面提取 workspace_id", "error")
+            return None
 
         except Exception as e:
             self._log(f"获取 Workspace ID 失败: {e}", "error")
@@ -1424,31 +1912,75 @@ class RegistrationEngine:
         consent_url = f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
         auth_code: Optional[str] = None
 
-        # 1) 直接访问 consent，看是否 302 带 code
+        # 0) 先访问本次 OAuth authorize 入口，确保 state/code_challenge 上下文是当前这次
         try:
-            resp_consent = session.get(
-                consent_url,
+            resp_entry = session.get(
+                oauth_start.auth_url,
                 headers={"referer": f"{self.oauth_issuer}/log-in"},
                 allow_redirects=False,
                 timeout=30,
             )
             self._raise_if_phone_required(
-                url=str(resp_consent.url),
-                text=resp_consent.text or "",
-                stage="OAuth Consent",
+                url=str(resp_entry.url),
+                text=resp_entry.text or "",
+                stage="OAuth Authorize 入口",
             )
-            if resp_consent.status_code in (301, 302, 303, 307, 308):
-                loc = resp_consent.headers.get("Location", "")
-                self._raise_if_phone_required(url=loc, stage="OAuth Consent(Location)")
-                auth_code = _extract_code_from_url(loc) or self._oauth_follow_and_extract_code(session, loc)
+            self._log(f"OAuth Authorize 入口状态: {resp_entry.status_code}")
+            if resp_entry.status_code in (301, 302, 303, 307, 308):
+                loc = resp_entry.headers.get("Location", "")
+                self._raise_if_phone_required(url=loc, stage="OAuth Authorize 入口(Location)")
+                entry_next = urljoin(oauth_start.auth_url, loc) if loc else ""
+                if entry_next:
+                    if "/sign-in-with-chatgpt/codex/consent" in entry_next:
+                        consent_url = entry_next
+                        self._log(f"OAuth Authorize 入口跳转到 Consent: {consent_url[:120]}...")
+                    auth_code = _extract_code_from_url(entry_next)
+                    if not auth_code:
+                        auth_code = self._oauth_follow_and_extract_code(session, entry_next)
+            elif resp_entry.status_code == 200:
+                entry_callback = self._extract_redirect_from_html(resp_entry.text or "", oauth_start.redirect_uri)
+                if entry_callback:
+                    auth_code = _extract_code_from_url(entry_callback)
+                if not auth_code and "/sign-in-with-chatgpt/codex/consent" in str(resp_entry.url):
+                    consent_url = str(resp_entry.url)
         except Exception as e:
             m = re.search(r"(https?://localhost[^\s'\"]+)", str(e))
             if m:
                 auth_code = _extract_code_from_url(m.group(1))
 
+        # 1) 直接访问 consent，看是否 302 带 code
+        if not auth_code:
+            try:
+                resp_consent = session.get(
+                    consent_url,
+                    headers={"referer": f"{self.oauth_issuer}/log-in"},
+                    allow_redirects=False,
+                    timeout=30,
+                )
+                self._raise_if_phone_required(
+                    url=str(resp_consent.url),
+                    text=resp_consent.text or "",
+                    stage="OAuth Consent",
+                )
+                if resp_consent.status_code in (301, 302, 303, 307, 308):
+                    loc = resp_consent.headers.get("Location", "")
+                    self._raise_if_phone_required(url=loc, stage="OAuth Consent(Location)")
+                    auth_code = _extract_code_from_url(loc) or self._oauth_follow_and_extract_code(session, loc)
+                elif resp_consent.status_code == 200:
+                    auth_code = self._oauth_submit_consent_form(
+                        session,
+                        page_url=str(resp_consent.url),
+                        html_text=resp_consent.text or "",
+                        redirect_uri=oauth_start.redirect_uri,
+                    )
+            except Exception as e:
+                m = re.search(r"(https?://localhost[^\s'\"]+)", str(e))
+                if m:
+                    auth_code = _extract_code_from_url(m.group(1))
+
         # 2) 走 workspace / organization 流程
         if not auth_code:
-            workspace_id = self._oauth_get_workspace_id(session)
+            workspace_id = self._oauth_get_workspace_id(session, consent_url=consent_url)
             if workspace_id:
                 headers = {
                     "referer": consent_url,
@@ -1589,6 +2121,7 @@ class RegistrationEngine:
             max_attempts = 3
             for attempt in range(1, max_attempts + 1):
                 try:
+                    self._oauth_wait_global_cooldown_if_needed()
                     oauth_start = oauth_manager.start_oauth()
                     self._log(f"OAuth URL 已生成(复用会话): {oauth_start.auth_url[:80]}...")
 
@@ -1625,6 +2158,13 @@ class RegistrationEngine:
                     )
                     if attempt >= max_attempts:
                         return None
+                except Exception as e:
+                    error_text = str(e)
+                    if self._oauth_is_rate_limited(error_text):
+                        self._oauth_handle_rate_limit(attempt, stage="OAuth 复用会话")
+                        return None
+                    self._log(f"复用会话 OAuth 异常: {error_text}", "warning")
+                    continue
 
         except Exception as e:
             self._log(f"复用会话 OAuth 失败: {e}", "warning")
@@ -1645,6 +2185,7 @@ class RegistrationEngine:
             last_error = ""
             for attempt in range(1, max_attempts + 1):
                 try:
+                    self._oauth_wait_global_cooldown_if_needed()
                     self._log(f"尝试 OAuth 登录流程获取 Token（第 {attempt}/{max_attempts} 次）")
                     oauth_start = oauth_manager.start_oauth()
                     self._log(f"OAuth URL 已生成: {oauth_start.auth_url[:80]}...")
@@ -1668,51 +2209,79 @@ class RegistrationEngine:
                             raise OAuthPhoneRequiredError("登录入口需要手机号验证")
                         last_error = f"登录入口失败: {login_start.error_message or 'unknown'}"
                         self._log(last_error, "warning")
+                        if self._oauth_is_rate_limited(last_error):
+                            self._oauth_handle_rate_limit(attempt, stage="OAuth 登录")
+                            return None
                         continue
 
+                    need_email_otp = True
                     if login_start.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
                         password_result = self._oauth_submit_login_password(session)
                         if not password_result.success or not password_result.is_existing_account:
                             if password_result.error_message == "PHONE_REQUIRED":
                                 raise OAuthPhoneRequiredError("登录密码阶段需要手机号验证")
                             if (password_result.page_type or "") == "about_you":
-                                self._handle_about_you("登录密码阶段")
-                                last_error = "登录密码阶段命中 about-you，已尝试补全资料"
+                                handled_about_you = self._handle_about_you("登录密码阶段")
+                                if handled_about_you:
+                                    need_email_otp = False
+                                    self._log("登录密码阶段 about-you 已处理，继续尝试提取授权码")
+                                else:
+                                    last_error = "登录密码阶段命中 about-you，补全资料失败"
+                                    self._log(last_error, "warning")
+                                    continue
+                            else:
+                                last_error = f"登录密码阶段未进入验证码页面: {password_result.page_type or 'unknown'}"
                                 self._log(last_error, "warning")
                                 continue
-                            last_error = f"登录密码阶段未进入验证码页面: {password_result.page_type or 'unknown'}"
-                            self._log(last_error, "warning")
-                            continue
                     elif login_start.page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
                         self._log("已进入验证码页面，跳过密码步骤")
                     else:
                         if login_start.page_type == "about_you":
-                            self._handle_about_you("登录入口")
-                            last_error = "登录入口命中 about-you，已尝试补全资料"
+                            handled_about_you = self._handle_about_you("登录入口")
+                            if handled_about_you:
+                                need_email_otp = False
+                                self._log("登录入口 about-you 已处理，继续尝试提取授权码")
+                            else:
+                                last_error = "登录入口命中 about-you，补全资料失败"
+                                self._log(last_error, "warning")
+                                continue
+                        elif self._is_phone_required(page_type=login_start.page_type):
+                            raise OAuthPhoneRequiredError("登录入口需要手机号验证")
+                        else:
+                            last_error = f"登录入口未进入预期页面: {login_start.page_type}"
                             self._log(last_error, "warning")
                             continue
-                        if self._is_phone_required(page_type=login_start.page_type):
-                            raise OAuthPhoneRequiredError("登录入口需要手机号验证")
-                        last_error = f"登录入口未进入预期页面: {login_start.page_type}"
-                        self._log(last_error, "warning")
-                        continue
 
-                    self._log("获取邮箱验证码")
-                    code = self.wait_for_verification_email(timeout=120)
-                    if not code:
-                        last_error = "获取邮箱验证码失败"
-                        self._log(last_error, "warning")
-                        continue
+                    if need_email_otp:
+                        self._log("获取邮箱验证码")
+                        code = self.wait_for_verification_email(timeout=120)
+                        if not code:
+                            last_error = "获取邮箱验证码失败"
+                            self._log(last_error, "warning")
+                            continue
 
-                    self._log("校验邮箱验证码")
-                    if not self._oauth_validate_verification_code(session, code):
-                        last_error = "验证码校验失败"
-                        self._log(last_error, "warning")
-                        continue
+                        self._log("校验邮箱验证码")
+                        if not self._oauth_validate_verification_code(session, code):
+                            last_error = "验证码校验失败"
+                            self._log(last_error, "warning")
+                            continue
+                    else:
+                        self._log("本次流程无需邮箱验证码，直接进入授权码提取")
 
                     auth_code = self._oauth_exchange_auth_code(session, oauth_start)
                     if not auth_code:
-                        self._log("未能从 OAuth consent 流程提取 code", "error")
+                        self._log("未能从 OAuth consent 流程提取 code，尝试重定向链兜底", "warning")
+                        fallback_callback = self._oauth_follow_redirects(session, oauth_start.auth_url)
+                        if fallback_callback:
+                            token_info = self._oauth_handle_callback(
+                                oauth_manager,
+                                oauth_start,
+                                fallback_callback,
+                            )
+                            if token_info:
+                                self._oauth_session_token = session.cookies.get("__Secure-next-auth.session-token") or ""
+                                return token_info
+                        self._log("OAuth 重定向链兜底未提取到回调", "error")
                         last_error = "未能从 OAuth consent 流程提取 code"
                         continue
 
@@ -1734,6 +2303,9 @@ class RegistrationEngine:
                         return None
                 except Exception as e:
                     last_error = str(e)
+                    if self._oauth_is_rate_limited(last_error):
+                        self._oauth_handle_rate_limit(attempt, stage="OAuth 登录")
+                        return None
                     self._log(f"OAuth 登录流程异常: {e}，准备重试", "warning")
                     continue
 
@@ -1764,6 +2336,11 @@ class RegistrationEngine:
     def run(self) -> RegistrationResult:
         result = RegistrationResult(success=False, logs=self.logs)
         token_source = "unknown"
+        issued_client_id = ""
+        token_audience = []
+        token_scope = ""
+        auth_profile = "unknown"
+        registration_completed = False
 
         try:
             self._log("=" * 60)
@@ -1863,6 +2440,7 @@ class RegistrationEngine:
             
             _random_delay(0.2, 0.5)
             self.callback()
+            registration_completed = True
 
             # 抓取 Token
             if self.token_mode == "oauth":
@@ -1874,14 +2452,25 @@ class RegistrationEngine:
                     result.refresh_token = tokens.get("refresh_token") or ""
                     result.id_token = tokens.get("id_token") or ""
                     result.account_id = tokens.get("account_id") or result.account_id
+                    issued_client_id = str(tokens.get("issued_client_id") or "").strip()
+                    token_audience = tokens.get("token_audience") or []
+                    if not isinstance(token_audience, list):
+                        token_audience = [str(token_audience)]
+                    token_scope = str(tokens.get("token_scope") or "").strip()
                     if not result.email and tokens.get("email"):
                         result.email = tokens.get("email")
                     result.success = True
                     token_source = "oauth"
+                    auth_profile = "codex_oauth"
                     result.session_token = self._oauth_session_token or self._get_session_cookie()
                 else:
+                    result.session_token = result.session_token or self._get_session_cookie() or ""
                     self._log("OAuth Token 获取失败（OAuth 模式不回退 Session）", "warning")
-                    result.error_message = "OAuth Token 获取失败"
+                    recent_logs = " ".join(self.logs[-8:]).lower()
+                    if self._oauth_is_rate_limited(recent_logs):
+                        result.error_message = "OAuth Token 获取失败: rate_limited"
+                    else:
+                        result.error_message = "OAuth Token 获取失败"
             else:
                 self._log("尝试从 ChatGPT Session 提取 Token")
                 tokens = self.get_chatgpt_session_tokens()
@@ -1893,6 +2482,7 @@ class RegistrationEngine:
                     result.account_id = tokens.get("account_id") or result.account_id
                     result.success = True
                     token_source = "session"
+                    auth_profile = "session"
                     result.session_token = self._get_session_cookie()
                 else:
                     # 尝试用 OAuth 后备，其实不需要，只需要报没抓到就可以
@@ -1909,9 +2499,15 @@ class RegistrationEngine:
 
             result.metadata = {
                 "email_service": self.email_service.service_type.value,
+                "email_service_id": self.email_info.get("service_id") if self.email_info else None,
                 "proxy_used": self.proxy_url,
                 "token_mode": self.token_mode,
                 "token_source": token_source,
+                "auth_profile": auth_profile,
+                "issued_client_id": issued_client_id,
+                "token_audience": token_audience,
+                "token_scope": token_scope,
+                "registration_completed": registration_completed,
                 "registered_at": datetime.now().isoformat(),
                 "user_agent": self.ua,
             }
@@ -1927,12 +2523,20 @@ class RegistrationEngine:
             return False
         try:
             settings = get_settings()
+            metadata = result.metadata or {}
+            token_source = str(metadata.get("token_source") or "").strip().lower()
+            issued_client_id = str(metadata.get("issued_client_id") or "").strip()
+            client_id_for_db = issued_client_id or (
+                settings.openai_client_id
+                if token_source in {"oauth", "browser_oauth"} and result.refresh_token
+                else None
+            )
             with get_db() as db:
                 account = crud.create_account(
                     db,
                     email=result.email,
                     password=result.password,
-                    client_id=settings.openai_client_id,
+                    client_id=client_id_for_db,
                     session_token=result.session_token,
                     email_service=self.email_service.service_type.value,
                     email_service_id=self.email_info.get("service_id") if self.email_info else None,
