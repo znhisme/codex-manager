@@ -39,11 +39,20 @@ class BrowserRegistrationEngine:
         pause_flag = str(os.environ.get("BROWSER_STEP_PAUSE", "")).lower() in ("1", "true", "yes", "on")
         refresh_flag = str(os.environ.get("BROWSER_AUTO_REFRESH", "1")).lower() in ("1", "true", "yes", "on")
         skip_oauth_flag = str(os.environ.get("BROWSER_SKIP_OAUTH", "")).lower() in ("1", "true", "yes", "on")
+        headless_env = str(os.environ.get("BROWSER_HEADLESS", "")).strip().lower()
+        if headless_env in ("1", "true", "yes", "on"):
+            headless_flag = True
+        elif headless_env in ("0", "false", "no", "off"):
+            headless_flag = False
+        else:
+            # 默认无头，便于 Docker 部署；调试模式下自动切有头
+            headless_flag = not debug_flag and not keep_open_flag
         self.debug_enabled = debug_flag
         self.keep_browser_open = keep_open_flag or debug_flag
         self.step_pause = pause_flag
         self.auto_refresh_on_stuck = refresh_flag
         self.skip_oauth = skip_oauth_flag
+        self.headless = headless_flag
 
     def _debug_pause(self, page, reason: str):
         if not self.step_pause:
@@ -495,14 +504,17 @@ class BrowserRegistrationEngine:
         name = user_info['name']
         birthdate = user_info['birthdate']
 
-        self._log(f"使用有头浏览器注册，分配邮箱: {self.email}")
+        browser_mode_label = "无头" if self.headless else "有头"
+        self._log(f"使用{browser_mode_label}浏览器注册，分配邮箱: {self.email}")
         
         with sync_playwright() as p:
             launch_args = {
-                "headless": False,
+                "headless": self.headless,
                 "args": [
                     "--disable-blink-features=AutomationControlled",
                     "--incognito",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
                 ]
             }
             if self.proxy_url:
