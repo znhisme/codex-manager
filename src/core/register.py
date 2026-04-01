@@ -327,18 +327,8 @@ class RegistrationEngine:
             self.token_mode = "session"
 
         self.impersonate, self.chrome_major, self.chrome_full, self.ua, self.sec_ch_ua = _random_chrome_version()
-        self.session = cffi_requests.Session(impersonate=self.impersonate)
-        if proxy_url:
-            self.session.proxies = {"http": proxy_url, "https": proxy_url}
-        
-        self.session.headers.update({
-            "User-Agent": self.ua,
-            "Accept-Language": "en-US,en;q=0.9",
-            "sec-ch-ua": self.sec_ch_ua, "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"', "sec-ch-ua-arch": '"x86"', "sec-ch-ua-bitness": '"64"',
-            "sec-ch-ua-full-version": f'"{self.chrome_full}"',
-        })
-        
+        self.session = self._create_registration_session()
+
         self.device_id = str(uuid.uuid4())
         self.session.cookies.set("oai-did", self.device_id, domain="chatgpt.com")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
@@ -457,6 +447,102 @@ class RegistrationEngine:
         else:
             logger.info(log_message)
 
+    def _default_session_headers(self) -> Dict[str, str]:
+        return {
+            "User-Agent": self.ua,
+            "Accept-Language": "en-US,en;q=0.9",
+            "sec-ch-ua": self.sec_ch_ua,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-arch": '"x86"',
+            "sec-ch-ua-bitness": '"64"',
+            "sec-ch-ua-full-version": f'"{self.chrome_full}"',
+        }
+
+    def _create_registration_session(self) -> cffi_requests.Session:
+        session = cffi_requests.Session(impersonate=self.impersonate)
+        if self.proxy_url:
+            session.proxies = {"http": self.proxy_url, "https": self.proxy_url}
+        session.headers.update(self._default_session_headers())
+        return session
+
+    def _copy_session_cookies(self, source: Any, target: Any) -> None:
+        if source is None or target is None:
+            return
+        copied = 0
+        try:
+            src_jar = getattr(source, "jar", None)
+            if src_jar is not None:
+                for item in list(src_jar):
+                    name = str(getattr(item, "name", "") or "").strip()
+                    value = str(getattr(item, "value", "") or "")
+                    if not name:
+                        continue
+                    domain = str(getattr(item, "domain", "") or "").strip()
+                    path = str(getattr(item, "path", "") or "/").strip() or "/"
+                    if domain:
+                        target.set(name, value, domain=domain, path=path)
+                    else:
+                        target.set(name, value, path=path)
+                    copied += 1
+        except Exception:
+            copied = 0
+
+        if copied > 0:
+            return
+
+        # 兼容简化 Cookie 容器（例如单测中的 dict）
+        try:
+            for name, value in list(getattr(source, "items", lambda: [])()):
+                name_str = str(name or "").strip()
+                if not name_str:
+                    continue
+                target.set(name_str, str(value or ""))
+        except Exception:
+            pass
+
+    def _is_retryable_transport_error(self, err: Exception) -> bool:
+        text = str(err or "").lower()
+        if not text:
+            return False
+        keywords = (
+            "curl: (28)",
+            "operation timed out",
+            "curl: (35)",
+            "tls connect error",
+            "connection timed out",
+            "connection reset",
+            "failed to perform",
+            "recv failure",
+            "send failure",
+            "empty reply from server",
+        )
+        return any(k in text for k in keywords)
+
+    def _recreate_session_keep_cookies(self, reason: str = "") -> None:
+        old_session = self.session
+        try:
+            new_session = self._create_registration_session()
+            self._copy_session_cookies(getattr(old_session, "cookies", None), new_session.cookies)
+            # 确保核心 did cookie 始终存在
+            if getattr(self, "device_id", None):
+                did = str(self.device_id).strip()
+                if did:
+                    new_session.cookies.set("oai-did", did, domain="chatgpt.com")
+                    new_session.cookies.set("oai-did", did, domain=".auth.openai.com")
+                    new_session.cookies.set("oai-did", did, domain="auth.openai.com")
+            self.session = new_session
+            if reason:
+                self._log(f"检测到网络抖动，已重建 HTTP 会话: {reason}", "warning")
+        except Exception as e:
+            self._log(f"重建 HTTP 会话失败: {e}", "warning")
+        finally:
+            try:
+                if old_session is not None:
+                    old_session.close()
+            except Exception:
+                pass
+
     def _request_with_retry(
         self,
         method: str,
@@ -481,6 +567,8 @@ class RegistrationEngine:
                     self._log(f"{label}请求异常: {e} (第 {attempt}/{retry_val} 次)", "warning")
                 else:
                     self._log(f"请求异常: {e} (第 {attempt}/{retry_val} 次)", "warning")
+                if self._is_retryable_transport_error(e) and attempt < retry_val:
+                    self._recreate_session_keep_cookies(reason=f"{label or method.upper()} 第{attempt}次异常")
                 if attempt < retry_val:
                     time.sleep(min(2.0 * attempt, 6.0))
 
@@ -706,10 +794,12 @@ class RegistrationEngine:
     def send_otp(self):
         self._otp_sent_at = time.time()
         url = f"{self.AUTH}/api/accounts/email-otp/send"
+        otp_timeout = max(15, min(int(self.request_timeout or 30), 35))
         r = self._request_with_retry(
             "get",
             url,
             label="Send OTP",
+            timeout=otp_timeout,
             headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Referer": f"{self.AUTH}/create-account/password", "Upgrade-Insecure-Requests": "1",
@@ -723,6 +813,7 @@ class RegistrationEngine:
 
     def validate_otp(self, code: str, sentinel_token: str = None):
         url = f"{self.AUTH}/api/accounts/email-otp/validate"
+        otp_timeout = max(15, min(int(self.request_timeout or 30), 35))
         headers = {"Content-Type": "application/json", "Accept": "application/json",
                     "Referer": f"{self.AUTH}/email-verification", "Origin": self.AUTH}
         headers.update(_make_trace_headers())
@@ -731,6 +822,7 @@ class RegistrationEngine:
             "post",
             url,
             label="Validate OTP",
+            timeout=otp_timeout,
             json={"code": code},
             headers=headers,
         )
@@ -3655,13 +3747,25 @@ class RegistrationEngine:
                 _random_delay(0.3, 0.8)
                 status, data = self.validate_otp(otp_code, sentinel_token)
                 if status != 200:
-                    self._log("验证码通过失败，重试发送...")
-                    self.send_otp()
-                    _random_delay(1.0, 2.0)
-                    otp_code = self.wait_for_verification_email(timeout=60)
-                    if not otp_code: raise Exception("重试验证码失败")
-                    status, data = self.validate_otp(otp_code, sentinel_token)
-                    if status != 200: raise Exception("OTP验证反复失败")
+                    if status == 0:
+                        self._log("验证码校验请求失败，疑似网络波动；先使用同一验证码重试一次", "warning")
+                        _random_delay(1.0, 2.0)
+                        status, data = self.validate_otp(otp_code, sentinel_token)
+
+                    if status != 200:
+                        self._log("验证码通过失败，重试发送...")
+                        resend_status, _ = self.send_otp()
+                        if resend_status == 200:
+                            _random_delay(1.0, 2.0)
+                            otp_code = self.wait_for_verification_email(timeout=60)
+                            if not otp_code: raise Exception("重试验证码失败")
+                            status, data = self.validate_otp(otp_code, sentinel_token)
+                        elif status == 0:
+                            # 重发本身也失败时，保留最后一次用原验证码校验机会，减少网络波动导致的假失败
+                            self._log("重发验证码请求失败，回退再次校验上一次验证码", "warning")
+                            _random_delay(1.0, 2.0)
+                            status, data = self.validate_otp(otp_code, sentinel_token)
+                        if status != 200: raise Exception("OTP验证反复失败")
 
             # 继续流程
             continue_url = ""
