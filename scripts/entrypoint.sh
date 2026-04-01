@@ -16,8 +16,16 @@ fi
 
 if [ -x "$CURRENT_DIR/$EXECUTABLE_NAME" ]; then
   cd "$CURRENT_DIR"
-  exec "./$EXECUTABLE_NAME"
+  set -- "./$EXECUTABLE_NAME"
+else
+  cd "$DEFAULT_APP_DIR"
+  set -- python /app/webui.py
 fi
 
-cd "$DEFAULT_APP_DIR"
-exec python /app/webui.py
+if command -v xvfb-run >/dev/null 2>&1; then
+  if [ -z "${DISPLAY:-}" ] && [ "${ENABLE_XVFB:-1}" = "1" ]; then
+    exec xvfb-run -a -s "-screen 0 1280x720x24" "$@"
+  fi
+fi
+
+exec "$@"
