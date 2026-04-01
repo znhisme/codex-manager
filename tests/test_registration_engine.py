@@ -737,3 +737,44 @@ def test_register_retries_on_transient_502_and_succeeds(monkeypatch):
     second_headers = session.calls[1]["kwargs"]["headers"]
     assert first_headers.get("openai-sentinel-token") == "sentinel-initial"
     assert second_headers.get("openai-sentinel-token") == "sentinel-refreshed"
+
+
+def test_oauth_submit_authorize_continue_api_extracts_workspace_from_payload():
+    session = QueueSession([
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["signup"],
+            DummyResponse(
+                status_code=200,
+                payload={"data": {"workspaces": [{"id": "ws-from-api"}]}},
+                text='{"data":{"workspaces":[{"id":"ws-from-api"}]}}',
+                url=OPENAI_API_ENDPOINTS["signup"],
+            ),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["select_workspace"],
+            DummyResponse(
+                status_code=200,
+                payload={"continue_url": "https://auth.example.test/continue-api-ws"},
+                text='{"continue_url":"https://auth.example.test/continue-api-ws"}',
+            ),
+        ),
+        (
+            "GET",
+            "https://auth.example.test/continue-api-ws",
+            DummyResponse(
+                status_code=302,
+                headers={"Location": "http://localhost:1455/auth/callback?code=code-api-ws-1&state=state-1"},
+            ),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+
+    code = engine._oauth_submit_authorize_continue_api(
+        session=session,
+        page_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        redirect_uri="http://localhost:1455/auth/callback",
+    )
+
+    assert code == "code-api-ws-1"

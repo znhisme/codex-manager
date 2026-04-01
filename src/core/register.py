@@ -1069,6 +1069,30 @@ class RegistrationEngine:
             return None
         return None
 
+    def _extract_workspace_id_from_payload(self, payload: Any) -> Optional[str]:
+        """从 authorize/continue 等 JSON 响应里递归提取 workspace_id。"""
+        if isinstance(payload, dict):
+            direct = str(payload.get("workspace_id") or payload.get("workspaceId") or "").strip()
+            if direct:
+                return direct
+            workspaces = payload.get("workspaces")
+            if isinstance(workspaces, list):
+                for item in workspaces:
+                    if isinstance(item, dict):
+                        ws_id = str(item.get("id") or item.get("workspace_id") or "").strip()
+                        if ws_id:
+                            return ws_id
+            for value in payload.values():
+                ws_id = self._extract_workspace_id_from_payload(value)
+                if ws_id:
+                    return ws_id
+        elif isinstance(payload, list):
+            for item in payload:
+                ws_id = self._extract_workspace_id_from_payload(item)
+                if ws_id:
+                    return ws_id
+        return None
+
     def _oauth_submit_authorize_continue_api(
         self,
         session: cffi_requests.Session,
@@ -1125,6 +1149,15 @@ class RegistrationEngine:
                     text=response_text,
                     stage="OAuth Consent API 兜底",
                 )
+                if not continue_url:
+                    payload_workspace_id = self._extract_workspace_id_from_payload(resp_data)
+                    if payload_workspace_id:
+                        self._log(f"Consent API 兜底提取到 workspace_id: {payload_workspace_id}")
+                        ws_continue_url = self._oauth_select_workspace(session, payload_workspace_id)
+                        if ws_continue_url:
+                            code = self._oauth_follow_and_extract_code(session, ws_continue_url)
+                            if code:
+                                return code
 
             if continue_url:
                 next_url = continue_url if continue_url.startswith("http") else f"{self.oauth_issuer}{continue_url}"
