@@ -1597,9 +1597,10 @@ class RegistrationEngine:
         enable_workspace_fallback: bool = True,
     ) -> Optional[str]:
         """Consent 兜底：调用 authorize/continue API 后继续提取 code。"""
-        payload_candidates = ({},)
+        # 默认至少尝试空载荷和 action=default，兼容不同风控分流。
+        payload_candidates = ({}, {"action": "default"})
         if self.oauth_enable_legacy_consent_payloads:
-            payload_candidates = ({}, {"action": "accept"}, {"action": "default"})
+            payload_candidates = ({}, {"action": "default"}, {"action": "accept"})
         sentinel_header = self._oauth_login_sentinel or ""
         for payload in payload_candidates:
             try:
@@ -1901,6 +1902,22 @@ class RegistrationEngine:
                     )
                     if api_fallback_code:
                         return api_fallback_code
+                    # 405 + continue API 空响应时，补一次单次 workspace 紧急恢复（避免流程卡死）
+                    if workspace_id_hint:
+                        self._log(
+                            "Consent 405 恢复模式：continue API 未返回 code，尝试一次 workspace 兜底",
+                            "warning",
+                        )
+                        emergency_code = self._oauth_submit_authorize_continue_api(
+                            session,
+                            page_url=page_url,
+                            redirect_uri=redirect_uri,
+                            workspace_id_hint=workspace_id_hint,
+                            authorize_url=authorize_url,
+                            enable_workspace_fallback=True,
+                        )
+                        if emergency_code:
+                            return emergency_code
 
             if resp.status_code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("Location", "")
