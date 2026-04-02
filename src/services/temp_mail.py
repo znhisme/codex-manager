@@ -69,6 +69,9 @@ class TempMailService(BaseEmailService):
 
         # 邮箱缓存：email -> {jwt, address}
         self._email_cache: Dict[str, Dict[str, Any]] = {}
+        # 验证码缓存：按收件邮箱记录最近一次命中的验证码/邮件，避免跨调用重复消费旧邮件
+        self._last_code_cache: Dict[str, str] = {}
+        self._last_message_id_cache: Dict[str, str] = {}
 
     def _decode_mime_header(self, value: str) -> str:
         """解码 MIME 头，兼容 RFC 2047 编码主题。"""
@@ -174,6 +177,29 @@ class TempMailService(BaseEmailService):
             "body": body_text,
             "raw": raw,
         }
+
+    def _extract_mail_id(self, mail: Dict[str, Any]) -> str:
+        """提取邮件唯一标识，兼容不同 Worker 字段并提供兜底。"""
+        id_candidates = ("id", "mailId", "messageId", "msgId", "uuid")
+        for key in id_candidates:
+            value = mail.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+
+        created = (
+            mail.get("createdAt")
+            or mail.get("created_at")
+            or mail.get("createTime")
+            or mail.get("create_time")
+            or mail.get("date")
+            or mail.get("time")
+            or ""
+        )
+        subject = str(mail.get("subject") or mail.get("title") or "").strip()
+        sender = str(mail.get("from") or mail.get("fromAddress") or mail.get("source") or "").strip()
+
+        fallback_id = f"{created}|{sender}|{subject}".strip("|")
+        return fallback_id
 
     def _admin_headers(self) -> Dict[str, str]:
         """构造 admin 请求头"""
@@ -341,6 +367,7 @@ class TempMailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        exclude_codes: Optional[List[str]] = None,
     ) -> Optional[str]:
         """
         从 TempMail 邮箱获取验证码
@@ -351,6 +378,7 @@ class TempMailService(BaseEmailService):
             timeout: 超时时间（秒）
             pattern: 验证码正则
             otp_sent_at: OTP 发送时间戳（暂未使用）
+            exclude_codes: 需要跳过的历史验证码（可选）
 
         Returns:
             验证码字符串，超时返回 None
@@ -359,6 +387,15 @@ class TempMailService(BaseEmailService):
 
         start_time = time.time()
         seen_mail_ids: set = set()
+        excluded = {
+            str(code).strip()
+            for code in (exclude_codes or [])
+            if str(code or "").strip()
+        }
+        last_code = self._last_code_cache.get(email, "")
+        if last_code:
+            excluded.add(last_code)
+        last_message_id = self._last_message_id_cache.get(email, "")
 
         # 优先使用地址级 JWT（/api/mails），回退到 admin API
         cached = self._email_cache.get(email, {})
@@ -387,11 +424,13 @@ class TempMailService(BaseEmailService):
                     continue
 
                 for mail in mails:
-                    mail_id = mail.get("id")
-                    if not mail_id or mail_id in seen_mail_ids:
+                    mail_id = self._extract_mail_id(mail)
+                    if mail_id and mail_id in seen_mail_ids:
                         continue
-
-                    seen_mail_ids.add(mail_id)
+                    if mail_id:
+                        seen_mail_ids.add(mail_id)
+                    if mail_id and last_message_id and mail_id == last_message_id:
+                        continue
 
                     parsed = self._extract_mail_fields(mail)
                     sender = parsed["sender"].lower()
@@ -408,6 +447,11 @@ class TempMailService(BaseEmailService):
                     match = re.search(pattern, safe_content)
                     if match:
                         code = match.group(1)
+                        if code in excluded:
+                            continue
+                        self._last_code_cache[email] = code
+                        if mail_id:
+                            self._last_message_id_cache[email] = mail_id
                         logger.info(f"从 TempMail 邮箱 {email} 找到验证码: {code}")
                         self.update_status(True)
                         return code
@@ -495,6 +539,8 @@ class TempMailService(BaseEmailService):
 
         for address in emails_to_delete:
             self._email_cache.pop(address, None)
+            self._last_code_cache.pop(address, None)
+            self._last_message_id_cache.pop(address, None)
             removed = True
 
         if removed:

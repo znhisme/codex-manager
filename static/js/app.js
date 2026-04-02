@@ -1512,11 +1512,11 @@ async function handleBatchRegistration(requestData) {
     }
 }
 
-// 取消任务
+// 停止注册任务
 async function handleCancelTask() {
     // 禁用取消按钮，防止重复点击
     elements.cancelBtn.disabled = true;
-    addLog('info', '[系统] 正在提交取消请求...');
+    addLog('info', '[系统] 正在提交停止请求...');
 
     try {
         // 批量任务取消（包括普通批量模式和 Outlook 批量模式）
@@ -1524,8 +1524,8 @@ async function handleCancelTask() {
             // 优先通过 WebSocket 取消
             if (batchWebSocket && batchWebSocket.readyState === WebSocket.OPEN) {
                 batchWebSocket.send(JSON.stringify({ type: 'cancel' }));
-                addLog('warning', '[警告] 批量任务取消请求已提交');
-                toast.info('任务取消请求已提交');
+                addLog('warning', '[警告] 批量任务停止请求已提交');
+                toast.info('停止注册请求已提交');
             } else {
                 // 降级到 REST API
                 const endpoint = isOutlookBatchMode
@@ -1533,8 +1533,8 @@ async function handleCancelTask() {
                     : `/registration/batch/${currentBatch.batch_id}/cancel`;
 
                 await api.post(endpoint);
-                addLog('warning', '[警告] 批量任务取消请求已提交');
-                toast.info('任务取消请求已提交');
+                addLog('warning', '[警告] 批量任务停止请求已提交');
+                toast.info('停止注册请求已提交');
                 stopBatchPolling();
                 resetButtons();
             }
@@ -1544,8 +1544,8 @@ async function handleCancelTask() {
             // 优先通过 WebSocket 取消
             if (webSocket && webSocket.readyState === WebSocket.OPEN) {
                 webSocket.send(JSON.stringify({ type: 'cancel' }));
-                addLog('warning', '[警告] 任务取消请求已提交');
-                toast.info('任务取消请求已提交');
+                addLog('warning', '[警告] 停止注册请求已提交');
+                toast.info('停止注册请求已提交');
             } else {
                 // 降级到 REST API
                 await api.post(`/registration/tasks/${currentTask.task_uuid}/cancel`);
@@ -1557,12 +1557,12 @@ async function handleCancelTask() {
         }
         // 没有活动任务
         else {
-            addLog('warning', '[警告] 没有活动的任务可以取消');
-            toast.warning('没有活动的任务');
+            addLog('warning', '[警告] 没有活动的注册任务');
+            toast.warning('没有活动的注册任务');
             resetButtons();
         }
     } catch (error) {
-        addLog('error', `[错误] 取消失败: ${error.message}`);
+        addLog('error', `[错误] 停止失败: ${error.message}`);
         toast.error(error.message);
         // 恢复取消按钮，允许重试
         elements.cancelBtn.disabled = false;
