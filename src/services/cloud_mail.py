@@ -3,6 +3,7 @@ CloudMail 邮箱服务实现
 """
 
 import logging
+import os
 import re
 import secrets
 import time
@@ -71,6 +72,22 @@ class CloudMailService(BaseEmailService):
         self._email_cache: Dict[str, Dict[str, Any]] = {}
         self._last_code_cache: Dict[str, str] = {}
         self._last_message_id_cache: Dict[str, str] = {}
+        self._verbose_content_logging = (
+            self._is_truthy(self.config.get("verbose_content"))
+            or self._is_truthy(os.environ.get("CLOUD_MAIL_VERBOSE_CONTENT"))
+        )
+        quiet_raw = self.config.get("quiet_warnings")
+        if quiet_raw is None:
+            quiet_raw = os.environ.get("CLOUD_MAIL_QUIET", "1")
+        self._quiet_warnings = self._is_truthy(quiet_raw)
+        if self._verbose_content_logging:
+            self._quiet_warnings = False
+
+    @staticmethod
+    def _is_truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
     def _resolve_domain(self, config: Dict[str, Any]) -> str:
         domain = (
@@ -292,6 +309,7 @@ class CloudMailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        exclude_codes: Optional[List[str]] = None,
     ) -> Optional[str]:
         """轮询 CloudMail API 获取验证码。"""
         if not email:
@@ -308,6 +326,11 @@ class CloudMailService(BaseEmailService):
 
         start_time = time.time()
         poll_interval = max(1, int(self.config.get("poll_interval") or 3))
+        excluded = {
+            str(code).strip()
+            for code in (exclude_codes or [])
+            if str(code or "").strip()
+        }
 
         while time.time() - start_time < timeout:
             try:
@@ -321,11 +344,16 @@ class CloudMailService(BaseEmailService):
                 messages = self._extract_messages(data)
                 if not messages:
                     if not getattr(self, "_debug_dumped", False):
-                        try:
-                            snippet = json.dumps(data, ensure_ascii=False)[:500]
-                        except Exception:
-                            snippet = str(data)[:500]
-                        logger.warning(f"CloudMail 未解析到邮件列表，响应片段: {snippet}")
+                        if self._quiet_warnings:
+                            logger.debug("CloudMail 未解析到邮件列表（quiet 模式已静默）")
+                        elif self._verbose_content_logging:
+                            try:
+                                snippet = json.dumps(data, ensure_ascii=False)[:500]
+                            except Exception:
+                                snippet = str(data)[:500]
+                            logger.warning(f"CloudMail 未解析到邮件列表，响应片段: {snippet}")
+                        else:
+                            logger.warning("CloudMail 未解析到邮件列表（已隐藏响应片段）")
                         self._debug_dumped = True
                     time.sleep(poll_interval)
                     continue
@@ -357,6 +385,8 @@ class CloudMailService(BaseEmailService):
                         code = self._extract_code_from_text(raw_blob, pattern)
 
                     if code:
+                        if code in excluded:
+                            continue
                         candidates.append(
                             {
                                 "code": code,
@@ -386,12 +416,17 @@ class CloudMailService(BaseEmailService):
                     return found_code
 
                 if messages and not getattr(self, "_debug_no_code_dumped", False):
-                    sample = messages[0] if isinstance(messages[0], dict) else {}
-                    try:
-                        snippet = json.dumps(sample, ensure_ascii=False)[:400]
-                    except Exception:
-                        snippet = str(sample)[:400]
-                    logger.warning(f"CloudMail 已获取邮件但未匹配验证码，示例片段: {snippet}")
+                    if self._quiet_warnings:
+                        logger.debug("CloudMail 已获取邮件但未匹配验证码（quiet 模式已静默）")
+                    elif self._verbose_content_logging:
+                        sample = messages[0] if isinstance(messages[0], dict) else {}
+                        try:
+                            snippet = json.dumps(sample, ensure_ascii=False)[:400]
+                        except Exception:
+                            snippet = str(sample)[:400]
+                        logger.warning(f"CloudMail 已获取邮件但未匹配验证码，示例片段: {snippet}")
+                    else:
+                        logger.warning("CloudMail 已获取邮件但未匹配验证码（已隐藏示例片段）")
                     self._debug_no_code_dumped = True
 
             except Exception as e:

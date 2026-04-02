@@ -2,8 +2,6 @@
 
 自动化注册 OpenAI 账号的 Web UI 系统，支持多种邮箱服务、并发批量注册、代理管理和账号管理。
 
-⚠️ **暂时不能用：凹凸曼大杀四方**
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 
@@ -17,7 +15,7 @@ AI 站长交流群：https://t.me/vpsbbq
 
 - **🤖 完美全真模拟浏览器注册机制 (最新集成)**
   - 🖥️ **底层内核升级：** 全面弃用易被拦截的传统接口形式，采用 `curl_cffi` 结合 TLS 指纹混淆，注入真实 Chrome 指纹环境 (含完全对应的 Sec-Ch-Ua 与 Platform 级联特征)，避免风控阻断。
-  - 🧩 **本地化原生 PoW 求解：** 系统内置由纯 Python 实现的 Sentinel Token 求解器 (`SentinelTokenGenerator`)，不仅免去了沉重的浏览器依赖（如 Playwright），且能自动获取并求解授权及建号双阶段 Sentinel Token，提升请求合法度。
+  - 🧩 **本地化原生 PoW 求解：** 系统内置由纯 Python 实现的 Sentinel Token 求解器 (`SentinelTokenGenerator`)，配合 Playwright 浏览器流程自动获取并求解授权及建号双阶段 Sentinel Token，提升请求合法度。
   - 🔄 **原汁原味的跳转链路：** 100% 还原官方真实访问流，从访问 `chatgpt.com` 首页获取初始 CSRF，无缝转交 `signin/openai`，再跟随跳转到 `auth.openai.com` 授权。全自动化的跳转控制使成功率飙升。
 
 - **多邮箱服务支持**
@@ -38,10 +36,10 @@ AI 站长交流群：https://t.me/vpsbbq
 
 - **全新流式高匿取 Token 链路**
   - 新老账号完美融合与适配：走完全真实的建号步骤或遇已注册号自动转入二次验证，直接携带解算的 Sentinel Token 无感进行 OTP 校验。
-  - **支持两种 Token 获取方式**：
-    - **OAuth 登录流程（含 refresh_token）**：使用登录 + 授权 + 回调链路获取完整 token。
-    - **Session 提取**：注册/登录完成后直接从 `/api/auth/session` 抽取 token。
-  - **自动模式**：默认优先 OAuth，失败自动回退 Session，可在 UI 中切换。
+  - **推荐：仅 HTTP OAuth 通道**（`BROWSER_OAUTH_HTTP_ONLY=1`）：全程 HTTP，失败不回退浏览器。
+  - **备选：HTTP 优先 + 浏览器兜底**（`BROWSER_OAUTH_HTTP_FIRST=1`）：HTTP 失败时自动回退 Playwright。
+  - **兼容：Playwright 浏览器全流程**：保持原有浏览器链路，适合特定环境排障。
+  - 已移除独立 Session / Auto 旧入口，减少通道切换导致的不稳定问题。
 
 - **并发控制**
   - 流水线模式（Pipeline）：每隔 interval 秒启动新任务，限制最大并发数
@@ -129,29 +127,53 @@ cp .env.example .env
 
 ```bash
 # 默认启动（127.0.0.1:8000）
-python webui.py
+uv run webui.py
 
 # 指定地址和端口
-python webui.py --host 0.0.0.0 --port 8080
+uv run webui.py --host 0.0.0.0 --port 8080
 
 # 调试模式（热重载）
-python webui.py --debug
+uv run webui.py --debug
 
 # 设置 Web UI 访问密钥
-python webui.py --access-password mypassword
+uv run webui.py --access-password mypassword
 
 # 组合参数
-python webui.py --host 0.0.0.0 --port 8080 --access-password mypassword
+uv run webui.py --host 0.0.0.0 --port 8080 --access-password mypassword
 ```
+
+> ⚠️ 运行限制：**不支持无头模式**，请在有桌面环境的机器上运行（Windows/Linux GUI 均可）。
+>
+> 默认不会生成页面调试快照（`.json/.html/.png`）。仅当显式设置
+> `BROWSER_SAVE_PAGE_ELEMENTS=1` 时才会保存。
+>
+> CloudMail 验证码轮询日志默认隐藏“邮件内容片段”。如需排查可设置
+> `CLOUD_MAIL_VERBOSE_CONTENT=1` 临时开启。
+>
+> HTTP OAuth 日志默认启用安静模式（减少 Cookie 诊断、逐跳重定向刷屏）：
+> `HTTP_OAUTH_QUIET=1`。如需完整排障链路可临时开启
+> `HTTP_OAUTH_VERBOSE_TRACE=1`（会覆盖 quiet）。
+> 若要查看每次请求重试异常，可设置 `HTTP_REQUEST_RETRY_VERBOSE=1`。
+>
+> CloudMail 轮询过程可用 `CLOUD_MAIL_QUIET=1` 静默非关键告警（默认推荐）。
+>
+> 如需放慢浏览器节奏，可设置：
+> `BROWSER_DELAY_MULTIPLIER`、`BROWSER_TIMEOUT_MULTIPLIER`、
+> `BROWSER_OAUTH_PRE_DELAY_SECONDS`、`BROWSER_OAUTH_PRE_DELAY_JITTER_SECONDS`。
+> 开源默认建议值：`1.5 / 1.35 / 12 / 6`（按顺序对应以上四项）。
+> Token 获取方式建议：
+> - **推荐** `BROWSER_OAUTH_HTTP_ONLY=1`（仅 HTTP OAuth）
+> - 需要兜底可用 `BROWSER_OAUTH_HTTP_FIRST=1`（HTTP 优先，失败回退浏览器）
+> - 两项都不设时为 Playwright 全流程
 
 ### 守护进程模式（源码/单机推荐）
 
 ```bash
 # 启用守护进程（更新后自动拉起）
-python webui.py --guardian
+uv run webui.py --guardian
 
 # 可调参数（默认：5 次 / 300 秒 / 2 秒重启间隔）
-python webui.py --guardian --guardian-max-restarts 5 --guardian-window-seconds 300 --guardian-restart-delay 2
+uv run webui.py --guardian --guardian-max-restarts 5 --guardian-window-seconds 300 --guardian-restart-delay 2
 ```
 
 > `--access-password` 优先级高于数据库中保存的密钥设置，每次启动时生效。打包后的 exe 同样支持此参数：
@@ -165,7 +187,7 @@ python webui.py --guardian --guardian-max-restarts 5 --guardian-window-seconds 3
 
 ```bash
 export APP_DATABASE_URL="postgresql://user:password@host:5432/dbname"
-python webui.py
+uv run webui.py
 ```
 
 也支持 `DATABASE_URL`，优先级低于 `APP_DATABASE_URL`。
@@ -307,62 +329,18 @@ codex-manager/
 |------|------|
 || `ws://host/api/ws/logs/{uuid}` | 实时日志流 |
 
-## Docker 部署
+## 部署方式说明
 
-### 环境要求
+⚠️ **不建议/不支持 Docker 部署。**
 
-- Docker
-- Docker Compose
-
-### 快速部署
+当前版本仅建议使用本地桌面环境运行：
 
 ```bash
-# 克隆项目
-git clone https://github.com/moeacgx/codex-manager.git
-cd codex-manager
-
-# 启动服务
-docker-compose up -d
+uv run webui.py
 ```
 
-服务启动后访问 http://localhost:8000
-
-### 配置说明
-
-**端口映射**：默认 `8000` 端口，可在 `docker-compose.yml` 中修改。
-
-**数据持久化**：
-```yaml
-volumes:
-  - ./data:/app/data
-  - ./logs:/app/logs
-```
-
-**环境变量配置**：
-```yaml
-environment:
-  - APP_ACCESS_PASSWORD=mypassword
-  - APP_HOST=0.0.0.0
-  - APP_PORT=8000
-```
-
-### 常用命令
-
-```bash
-# 查看日志
-docker-compose logs -f
-
-# 停止服务
-docker-compose down
-
-# 更新代码并重建容器
-git pull
-docker-compose up -d --build --force-recreate
-```
-
-> 说明：仅执行 `docker-compose build --no-cache` 只会重建镜像，
-> **不会自动替换正在运行的旧容器**。更新后请使用
-> `docker-compose up -d --build --force-recreate` 让新代码生效。
+- 不支持无头模式
+- 推荐在有桌面环境的机器运行（本机/远程桌面均可）
 
 ## 注意事项
 
@@ -373,9 +351,9 @@ docker-compose up -d --build --force-recreate
 - 代理优先级：动态代理 > 代理列表（随机/默认） > 直连
 - CPA / Sub2API / Team Manager 上传始终直连，不走代理
 - 注册时自动随机生成用户名和生日（年龄范围 18-45 岁）
-- Token 获取方式支持 OAuth 登录流程或 Session 提取；自动模式默认优先 OAuth，失败回退 Session
+- Token 获取方式：推荐仅 HTTP OAuth（`BROWSER_OAUTH_HTTP_ONLY=1`），也支持 HTTP 优先/浏览器兜底
 - 支付链接生成使用账号 access_token 鉴权，走全局代理配置
-- 无痕浏览器优先使用 playwright（注入 cookie 直达支付页）；未安装时降级为系统 Chrome/Edge 无痕模式
+- Playwright 为必需依赖；请在有桌面环境下运行（不支持无头模式）
 - 安装完整支付功能：`pip install ".[payment]" && playwright install chromium`（可选）
 - 订阅状态自动检测调用 `chatgpt.com/backend-api/me`，走全局代理
 - 批量注册并发数上限为 50，线程池大小已相应调整

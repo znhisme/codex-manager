@@ -139,7 +139,7 @@ function buildRegistrationFormState() {
     return {
         email_service_values: getSelectedEmailServiceValues(),
         reg_mode: elements.regMode ? elements.regMode.value : 'single',
-        token_mode: elements.tokenMode ? elements.tokenMode.value : 'auto',
+        token_mode: elements.tokenMode ? elements.tokenMode.value : 'browser',
         batch_count: elements.batchCount ? elements.batchCount.value : '',
         concurrency_mode: elements.concurrencyMode ? elements.concurrencyMode.value : 'pipeline',
         concurrency_count: elements.concurrencyCount ? elements.concurrencyCount.value : '',
@@ -185,7 +185,12 @@ function applyRegistrationFormStateBase() {
             handleModeChange({ target: elements.regMode });
         }
         if (elements.tokenMode && registrationFormState.token_mode) {
-            elements.tokenMode.value = registrationFormState.token_mode;
+            let savedTokenMode = String(registrationFormState.token_mode || '').trim();
+            if (savedTokenMode === 'http_independent') {
+                savedTokenMode = 'browser_http_only';
+            }
+            const optionValues = Array.from(elements.tokenMode.options || []).map(opt => opt.value);
+            elements.tokenMode.value = optionValues.includes(savedTokenMode) ? savedTokenMode : 'browser';
         }
         if (elements.batchCount && registrationFormState.batch_count !== undefined) {
             elements.batchCount.value = registrationFormState.batch_count;
@@ -514,7 +519,7 @@ async function handleSaveSchedulerConfig() {
             register_threshold: parseInt(elements.cpaRegisterThreshold.value) || 10,
             register_batch_count: parseInt(elements.cpaRegisterBatchCount.value) || 5,
             email_service: emailServicePool.join(','),
-            token_mode: elements.tokenMode ? elements.tokenMode.value : 'auto',
+            token_mode: elements.tokenMode ? elements.tokenMode.value : 'browser',
         });
         toast.success("自动任务配置已保存");
         addLog('success', '[系统] 定时 CPA 任务及注册配置已保存');
@@ -547,7 +552,7 @@ async function handleStopSchedulerTask() {
             register_threshold: parseInt(elements.cpaRegisterThreshold.value) || 10,
             register_batch_count: parseInt(elements.cpaRegisterBatchCount.value) || 5,
             email_service: emailServicePool.join(','),
-            token_mode: elements.tokenMode ? elements.tokenMode.value : 'auto',
+            token_mode: elements.tokenMode ? elements.tokenMode.value : 'browser',
         });
         toast.info("已停止自动任务");
         addLog('warning', '[系统] 🔴 定时监控与自动注册已被手动停止');
@@ -903,7 +908,7 @@ async function handleStartRegistration(e) {
     // 构建请求数据（代理从设置中自动获取）
     const requestData = {
         email_service_type: emailServiceType,
-        token_mode: elements.tokenMode ? elements.tokenMode.value : 'auto',
+        token_mode: elements.tokenMode ? elements.tokenMode.value : 'browser',
         auto_upload_cpa: elements.autoUploadCpa ? elements.autoUploadCpa.checked : false,
         cpa_service_ids: elements.autoUploadCpa && elements.autoUploadCpa.checked ? getSelectedServiceIds(elements.cpaServiceSelect) : [],
         auto_upload_sub2api: elements.autoUploadSub2api ? elements.autoUploadSub2api.checked : false,
@@ -1619,7 +1624,7 @@ async function handleOutlookBatchRegistration() {
     const requestData = {
         service_ids: selectedIds,
         skip_registered: skipRegistered,
-        token_mode: elements.tokenMode ? elements.tokenMode.value : 'auto',
+        token_mode: elements.tokenMode ? elements.tokenMode.value : 'browser',
         interval_min: intervalMin,
         interval_max: intervalMax,
         concurrency: Math.min(50, Math.max(1, concurrency)),

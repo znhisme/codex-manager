@@ -32,6 +32,7 @@ def _load_dotenv():
     env_path = project_root / ".env"
     if not env_path.exists():
         return
+    parsed: dict[str, str] = {}
     with open(env_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -40,8 +41,12 @@ def _load_dotenv():
             key, _, value = line.partition("=")
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
-                os.environ[key] = value
+            if key:
+                # 同一文件内允许后面的同名键覆盖前面的值（更符合直觉）。
+                parsed[key] = value
+    for key, value in parsed.items():
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def setup_application():

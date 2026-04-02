@@ -6,6 +6,8 @@ import asyncio
 import logging
 import uuid
 import random
+import os
+import time
 import threading
 from datetime import datetime
 from typing import List, Optional, Dict, Tuple
@@ -16,7 +18,7 @@ from pydantic import BaseModel, Field
 from ...database import crud
 from ...database.session import get_db
 from ...database.models import RegistrationTask, Proxy
-from ...core.register import RegistrationEngine, RegistrationResult
+from ...core.register import RegistrationResult
 from ...core.pending_oauth import upsert_pending_oauth_account_from_result
 from ...services import EmailServiceFactory, EmailServiceType
 from ...config.settings import get_settings
@@ -123,11 +125,43 @@ def _normalize_email_service_pool(values: Optional[List[str]]) -> List[Tuple[str
     return normalized
 
 
+SUPPORTED_TOKEN_MODES = {
+    "browser",
+    "browser_http_first",
+    "browser_http_only",
+}
+
+
 def _normalize_token_mode(mode: str) -> str:
-    value = (mode or "auto").strip().lower()
-    if value not in ("session", "oauth", "auto", "browser"):
-        raise ValueError("Token 获取方式必须为 session / oauth / auto / browser")
-    return value
+    """规范化 token 获取方式。"""
+    value = (mode or "browser").strip().lower()
+    # 兼容旧值：http_independent -> browser_http_only
+    if value == "http_independent":
+        logger.warning("Token 获取方式 http_independent 已合并为 browser_http_only")
+        return "browser_http_only"
+    if value in SUPPORTED_TOKEN_MODES:
+        return value
+    logger.warning(f"Token 获取方式 {value} 不受支持，回退为 browser")
+    return "browser"
+
+
+def _get_shared_oauth_pre_delay_seconds() -> float:
+    """
+    与浏览器通道共用 OAuth 前置等待变量：
+    - BROWSER_OAUTH_PRE_DELAY_SECONDS
+    - BROWSER_OAUTH_PRE_DELAY_JITTER_SECONDS
+    """
+    try:
+        base = max(0.0, float(os.environ.get("BROWSER_OAUTH_PRE_DELAY_SECONDS", "0")))
+    except Exception:
+        base = 0.0
+    try:
+        jitter = max(0.0, float(os.environ.get("BROWSER_OAUTH_PRE_DELAY_JITTER_SECONDS", "0")))
+    except Exception:
+        jitter = 0.0
+    if jitter > 0:
+        base += random.uniform(0.0, jitter)
+    return max(0.0, base)
 
 
 def _pick_rr_service(pool: List[Tuple[str, Optional[int]]]) -> Tuple[str, Optional[int]]:
@@ -147,7 +181,7 @@ class RegistrationTaskCreate(BaseModel):
     """创建注册任务请求"""
     email_service_type: str = "tempmail"
     email_service_pool: List[str] = []
-    token_mode: str = "auto"
+    token_mode: str = "browser"
     proxy: Optional[str] = None
     email_service_config: Optional[dict] = None
     email_service_id: Optional[int] = None
@@ -164,7 +198,7 @@ class BatchRegistrationRequest(BaseModel):
     count: int = 1
     email_service_type: str = "tempmail"
     email_service_pool: List[str] = []
-    token_mode: str = "auto"
+    token_mode: str = "browser"
     proxy: Optional[str] = None
     email_service_config: Optional[dict] = None
     email_service_id: Optional[int] = None
@@ -235,7 +269,7 @@ class OutlookBatchRegistrationRequest(BaseModel):
     """Outlook 批量注册请求"""
     service_ids: List[int]
     skip_registered: bool = True
-    token_mode: str = "auto"
+    token_mode: str = "browser"
     proxy: Optional[str] = None
     interval_min: int = 5
     interval_max: int = 30
@@ -315,7 +349,7 @@ def _run_sync_registration_task(
     proxy: Optional[str],
     email_service_config: Optional[dict],
     email_service_id: Optional[int] = None,
-    token_mode: str = "session",
+    token_mode: str = "browser",
     log_prefix: str = "",
     batch_id: str = "",
     auto_upload_cpa: bool = False,
@@ -332,6 +366,9 @@ def _run_sync_registration_task(
     """
     with get_db() as db:
         try:
+            token_mode = _normalize_token_mode(token_mode)
+            http_oauth_first = token_mode == "browser_http_first"
+            http_oauth_only = token_mode == "browser_http_only"
             # 检查是否已取消
             if task_manager.is_cancelled(task_uuid):
                 logger.info(f"任务 {task_uuid} 已取消，跳过执行")
@@ -507,38 +544,77 @@ def _run_sync_registration_task(
                 log_callback(f"[邮箱] 使用服务: {label} (ID: {service_id_for_log}, 类型: {service_type.value})")
             else:
                 log_callback(f"[邮箱] 使用服务: {label} (类型: {service_type.value})")
-            log_callback(f"[Token] 获取方式: {'OAuth 授权' if token_mode == 'oauth' else 'Playwright 浏览器' if token_mode == 'browser' else 'Session 提取'}")
+            # 根据 token 模式选择引擎：
+            # 1) browser: 直接 Playwright
+            # 2) browser_http_first: 先全程 HTTP，失败回退 Playwright
+            # 3) browser_http_only: 仅全程 HTTP，失败不回退
+            active_engine = None
+            result = None
 
-            if token_mode == "browser":
+            if token_mode in {"browser_http_first", "browser_http_only"}:
+                if token_mode == "browser_http_first":
+                    log_callback("[Token] 全程 HTTP OAuth 优先（失败回退浏览器）")
+                else:
+                    log_callback("[Token] 仅 HTTP OAuth（失败不回退浏览器）")
+
                 try:
-                    from ...core.browser_register import BrowserRegistrationEngine
-                    engine = BrowserRegistrationEngine(
+                    from ...core.http_register_engine import RegistrationEngine as HttpRegistrationEngine
+                    http_engine = HttpRegistrationEngine(
                         email_service=email_service,
                         proxy_url=actual_proxy_url,
                         callback_logger=log_callback,
                         task_uuid=task_uuid,
+                        token_mode="oauth",
+                    )
+                except ImportError as ie:
+                    log_callback(f"[系统] 导入 HttpRegistrationEngine 失败: {ie}")
+                    raise ValueError("未完整部署独立 HTTP 注册引擎依赖")
+
+                active_engine = http_engine
+                result = http_engine.run()
+
+                if (not result.success) and token_mode == "browser_http_first":
+                    log_callback("[Token] HTTP 全程失败，回退 Playwright 浏览器流程")
+                    try:
+                        from ...core.browser_register import BrowserRegistrationEngine
+                        browser_engine = BrowserRegistrationEngine(
+                            email_service=email_service,
+                            proxy_url=actual_proxy_url,
+                            callback_logger=log_callback,
+                            task_uuid=task_uuid,
+                            oauth_http_first=False,
+                            oauth_http_only=False,
+                        )
+                    except ImportError as ie:
+                        log_callback(f"[系统] 导入 BrowserRegistrationEngine 失败: {ie}")
+                        raise ValueError("未完整部署浏览器注册引擎依赖")
+                    active_engine = browser_engine
+                    result = browser_engine.run()
+            else:
+                log_callback("[Token] Playwright 浏览器全流程（默认）")
+                try:
+                    from ...core.browser_register import BrowserRegistrationEngine
+                    browser_engine = BrowserRegistrationEngine(
+                        email_service=email_service,
+                        proxy_url=actual_proxy_url,
+                        callback_logger=log_callback,
+                        task_uuid=task_uuid,
+                        oauth_http_first=http_oauth_first,
+                        oauth_http_only=http_oauth_only,
                     )
                 except ImportError as ie:
                     log_callback(f"[系统] 导入 BrowserRegistrationEngine 失败: {ie}")
                     raise ValueError("未完整部署浏览器注册引擎依赖")
-            else:
-                engine = RegistrationEngine(
-                    email_service=email_service,
-                    proxy_url=actual_proxy_url,
-                    callback_logger=log_callback,
-                    task_uuid=task_uuid,
-                    token_mode=token_mode,
-                )
-
-            # 执行注册
-            result = engine.run()
+                active_engine = browser_engine
+                result = browser_engine.run()
 
             if result.success:
                 # 更新代理使用时间
                 update_proxy_usage(db, proxy_id)
 
                 # 保存到数据库
-                engine.save_to_database(result)
+                if active_engine:
+                    active_engine.save_to_database(result)
 
                 # 自动上传到 CPA（可多服务）
                 if auto_upload_cpa:
@@ -756,7 +832,7 @@ async def run_registration_task(
     proxy: Optional[str],
     email_service_config: Optional[dict],
     email_service_id: Optional[int] = None,
-    token_mode: str = "session",
+    token_mode: str = "browser",
     log_prefix: str = "",
     batch_id: str = "",
     auto_upload_cpa: bool = False,
@@ -775,6 +851,7 @@ async def run_registration_task(
     if loop is None:
         loop = asyncio.get_event_loop()
         task_manager.set_loop(loop)
+    token_mode = _normalize_token_mode(token_mode)
 
     # 初始化 TaskManager 状态
     task_manager.update_status(task_uuid, "pending")
@@ -845,7 +922,7 @@ async def run_batch_parallel(
     email_service_config: Optional[dict],
     email_service_id: Optional[int],
     concurrency: int,
-    token_mode: str = "session",
+    token_mode: str = "browser",
     email_service_pool: Optional[List[Tuple[str, Optional[int]]]] = None,
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
@@ -863,14 +940,10 @@ async def run_batch_parallel(
     add_batch_log, update_batch_status = _make_batch_helpers(batch_id)
     semaphore = asyncio.Semaphore(concurrency)
     counter_lock = asyncio.Lock()
+    token_mode = _normalize_token_mode(token_mode)
     jitter_min = max(0.0, float(oauth_jitter_min_seconds or 0))
     jitter_max = max(jitter_min, float(oauth_jitter_max_seconds or 0))
-    if token_mode == "auto":
-        add_batch_log("[系统] 并行模式不支持自动切换，已固定使用 OAuth")
-        token_mode = "oauth"
     add_batch_log(f"[系统] 并行模式启动，并发数: {concurrency}，总任务: {len(task_uuids)}")
-    if token_mode == "oauth" and jitter_max > 0:
-        add_batch_log(f"[系统] OAuth 启动抖动: {jitter_min:.1f}-{jitter_max:.1f}s")
 
     async def _run_one(idx: int, uuid: str):
         prefix = f"[任务{idx + 1}]"
@@ -933,7 +1006,7 @@ async def run_batch_pipeline(
     interval_min: int,
     interval_max: int,
     concurrency: int,
-    token_mode: str = "session",
+    token_mode: str = "browser",
     email_service_pool: Optional[List[Tuple[str, Optional[int]]]] = None,
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
@@ -952,6 +1025,7 @@ async def run_batch_pipeline(
     semaphore = asyncio.Semaphore(concurrency)
     counter_lock = asyncio.Lock()
     running_tasks_list = []
+    token_mode = _normalize_token_mode(token_mode)
     jitter_min = max(0.0, float(oauth_jitter_min_seconds or 0))
     jitter_max = max(jitter_min, float(oauth_jitter_max_seconds or 0))
     add_batch_log(f"[系统] 流水线模式启动，并发数: {concurrency}，总任务: {len(task_uuids)}")
@@ -1109,7 +1183,7 @@ async def run_batch_registration(
     interval_max: int,
     concurrency: int = 1,
     mode: str = "pipeline",
-    token_mode: str = "session",
+    token_mode: str = "browser",
     email_service_pool: Optional[List[Tuple[str, Optional[int]]]] = None,
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
@@ -1122,11 +1196,8 @@ async def run_batch_registration(
 ):
     """根据 mode 分发到并行或流水线执行"""
     settings = get_settings()
+    token_mode = _normalize_token_mode(token_mode)
     effective_concurrency = max(1, min(50, int(concurrency or 1)))
-    if token_mode in ("oauth", "auto"):
-        oauth_limit = max(0, int(settings.batch_oauth_max_concurrency or 0))
-        if oauth_limit > 0:
-            effective_concurrency = min(effective_concurrency, oauth_limit)
     effective_jitter_min = int(
         oauth_jitter_min_seconds
         if oauth_jitter_min_seconds is not None
@@ -1182,12 +1253,7 @@ async def start_registration(
         email_service_pool = _normalize_email_service_pool(request.email_service_pool)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    try:
-        token_mode = _normalize_token_mode(request.token_mode)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if token_mode == "auto":
-        token_mode = "oauth"
+    token_mode = _normalize_token_mode(request.token_mode)
 
     if email_service_pool:
         email_service_type, email_service_id = _pick_rr_service(email_service_pool)
@@ -1281,20 +1347,13 @@ async def start_batch_registration(
     if request.mode not in ("parallel", "pipeline"):
         raise HTTPException(status_code=400, detail="模式必须为 parallel 或 pipeline")
 
-    try:
-        token_mode = _normalize_token_mode(request.token_mode)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    token_mode = _normalize_token_mode(request.token_mode)
 
     from ...config.settings import get_settings
     settings = get_settings()
     global_limit = settings.global_concurrency or 0
     if global_limit > 0:
         request.concurrency = min(request.concurrency, global_limit)
-    if token_mode in ("oauth", "auto"):
-        oauth_limit = max(0, int(settings.batch_oauth_max_concurrency or 0))
-        if oauth_limit > 0:
-            request.concurrency = min(request.concurrency, oauth_limit)
     if request.concurrency < 1:
         request.concurrency = 1
     if request.concurrency > 50:
@@ -1307,13 +1366,7 @@ async def start_batch_registration(
         f"批量注册启动: 数量={request.count}, 并发={request.concurrency}, "
         f"模式={request.mode}, 间隔={request.interval_min}-{request.interval_max}s"
     )
-    if token_mode in ("oauth", "auto"):
-        logger.info(
-            "批量 OAuth 节流参数: max_concurrency=%s, jitter=%ss-%ss",
-            settings.batch_oauth_max_concurrency,
-            settings.batch_oauth_start_jitter_min_seconds,
-            settings.batch_oauth_start_jitter_max_seconds,
-        )
+    logger.info("Token 通道固定为 Playwright 浏览器")
 
     # 创建批量任务
     batch_id = str(uuid.uuid4())
@@ -1739,7 +1792,7 @@ async def run_outlook_batch_registration(
     interval_max: int,
     concurrency: int = 1,
     mode: str = "pipeline",
-    token_mode: str = "session",
+    token_mode: str = "browser",
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -1757,6 +1810,7 @@ async def run_outlook_batch_registration(
     if loop is None:
         loop = asyncio.get_event_loop()
         task_manager.set_loop(loop)
+    token_mode = _normalize_token_mode(token_mode)
 
     # 预先为每个 service_id 创建注册任务记录
     task_uuids = []
@@ -1823,18 +1877,11 @@ async def start_outlook_batch_registration(
     if request.mode not in ("parallel", "pipeline"):
         raise HTTPException(status_code=400, detail="模式必须为 parallel 或 pipeline")
 
-    try:
-        token_mode = _normalize_token_mode(request.token_mode)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    token_mode = _normalize_token_mode(request.token_mode)
 
     from ...config.settings import get_settings
     settings = get_settings()
     request.concurrency = max(1, int(settings.global_concurrency or 1))
-    if token_mode in ("oauth", "auto"):
-        oauth_limit = max(0, int(settings.batch_oauth_max_concurrency or 0))
-        if oauth_limit > 0:
-            request.concurrency = min(request.concurrency, oauth_limit)
     request.concurrency = max(1, min(50, int(request.concurrency)))
 
     # 过滤掉已注册的邮箱

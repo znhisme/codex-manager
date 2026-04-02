@@ -641,6 +641,23 @@ def process_pending_oauth_once(
                 proxy_url=account.proxy_used,
                 token_mode="oauth",
             )
+            legacy_removed_msg = str(getattr(engine, "LEGACY_REMOVED_MESSAGE", "") or "").strip()
+            if legacy_removed_msg:
+                _mark_pending_result(
+                    pending,
+                    account,
+                    status=OAUTH_PENDING_STATUS_FAILED,
+                    error_message=(
+                        "旧 OAuth 待授权队列流程已移除：当前仅支持 Playwright 浏览器通道。"
+                        "请重新走浏览器注册流程。"
+                    ),
+                    retry_after_seconds=None,
+                )
+                db.commit()
+                summary["failed"] += 1
+                _safe_log(logs, f"账号 {account.email} 跳过待授权队列：{legacy_removed_msg}", level="warning")
+                continue
+
             engine.email = account.email
             engine.password = account.password
             if mailbox_id:

@@ -521,9 +521,9 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
     ),
     "cpa_auto_register_token_mode": SettingDefinition(
         db_key="cpa.auto_register_token_mode",
-        default_value="auto",
+        default_value="browser",
         category=SettingCategory.CPA,
-        description="自动补充注册的 Token 获取方式（session / oauth / auto / browser）"
+        description="自动补充注册的 Token 获取方式（仅 browser）"
     ),
 
     # 验证码配置
@@ -1017,7 +1017,7 @@ class Settings(BaseModel):
     cpa_auto_register_threshold: int = 10
     cpa_auto_register_batch_count: int = 5
     cpa_auto_register_email_service: str = ""
-    cpa_auto_register_token_mode: str = "auto"
+    cpa_auto_register_token_mode: str = "browser"
 
     # 验证码配置
     email_code_timeout: int = 120
